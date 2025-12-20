@@ -1,0 +1,7 @@
+* text=auto
+*.py linguist-language=Python
+*.js linguist-language=JavaScript
+*.jsx linguist-language=JavaScript
+*.md text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
