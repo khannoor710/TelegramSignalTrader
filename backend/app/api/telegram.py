@@ -32,22 +32,50 @@ async def create_telegram_config(config: TelegramConfigCreate, db: Session = Dep
     """Create or update Telegram configuration"""
     import json
     
-    # Deactivate existing configs
-    db.query(TelegramConfig).update({"is_active": False})
+    # Try to find existing active config first
+    existing_config = db.query(TelegramConfig).filter(TelegramConfig.is_active).first()
     
-    # Create new config
-    db_config = TelegramConfig(
-        api_id=config.api_id,
-        api_hash=config.api_hash,
-        phone_number=config.phone_number,
-        monitored_chats=json.dumps(config.monitored_chats),
-        is_active=True
-    )
-    db.add(db_config)
-    db.commit()
-    db.refresh(db_config)
+    # If no active config, check for any config (handles edge cases)
+    if not existing_config:
+        existing_config = db.query(TelegramConfig).order_by(TelegramConfig.id.desc()).first()
     
-    return db_config
+    if existing_config:
+        # Update existing config and PRESERVE session_string
+        existing_config.api_id = config.api_id
+        existing_config.api_hash = config.api_hash
+        existing_config.phone_number = config.phone_number
+        existing_config.monitored_chats = json.dumps(config.monitored_chats)
+        existing_config.is_active = True
+        
+        # If this config doesn't have a session, try to recover from another config
+        if not existing_config.session_string:
+            session_donor = db.query(TelegramConfig).filter(
+                TelegramConfig.session_string.isnot(None),
+                TelegramConfig.id != existing_config.id
+            ).first()
+            if session_donor and session_donor.session_string:
+                existing_config.session_string = session_donor.session_string
+                logger.info(f"🔄 Recovered session_string from config #{session_donor.id}")
+        
+        # Note: session_string is preserved automatically as we don't modify it
+        db.commit()
+        db.refresh(existing_config)
+        logger.info(f"✅ Updated Telegram config (ID: {existing_config.id}), session_string preserved: {bool(existing_config.session_string)}")
+        return existing_config
+    else:
+        # Create new config only if none exists at all
+        db_config = TelegramConfig(
+            api_id=config.api_id,
+            api_hash=config.api_hash,
+            phone_number=config.phone_number,
+            monitored_chats=json.dumps(config.monitored_chats),
+            is_active=True
+        )
+        db.add(db_config)
+        db.commit()
+        db.refresh(db_config)
+        logger.info(f"✅ Created new Telegram config (ID: {db_config.id})")
+        return db_config
 
 
 @router.get("/config", response_model=TelegramConfigResponse)

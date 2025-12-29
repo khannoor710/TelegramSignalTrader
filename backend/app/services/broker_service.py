@@ -158,6 +158,55 @@ class AngelOneBrokerService(BrokerInterface):
         self.smart_api = None  # Will be SmartConnect instance
         self._client_id: Optional[str] = None
         self._is_logged_in = False
+        self._try_restore_session()  # Try to restore from saved session
+    
+    def _try_restore_session(self):
+        """Try to restore session from saved tokens"""
+        try:
+            from app.core.encryption import get_encryption_manager
+            
+            db = SessionLocal()
+            try:
+                # Get the most recent Angel One config with valid session
+                config = db.query(BrokerConfig).filter(
+                    BrokerConfig.broker_name == 'angel_one',
+                    BrokerConfig.auth_token.isnot(None),
+                    BrokerConfig.session_expiry > datetime.utcnow()
+                ).order_by(BrokerConfig.last_login.desc()).first()
+                
+                if not config:
+                    print("ℹ️ No saved broker session found")
+                    return  # No valid session found
+                
+                # Get encryption manager
+                encryption_manager = get_encryption_manager()
+                
+                # Decrypt tokens
+                jwt_token = encryption_manager.decrypt(config.auth_token)
+                
+                # Restore SmartAPI session
+                self.smart_api = SmartConnect(api_key=config.api_key)
+                self.smart_api.setAccessToken(jwt_token)
+                
+                # Validate the session actually works by making a test call
+                try:
+                    profile = self.smart_api.getProfile(config.client_id)
+                    if profile and profile.get('status', False):
+                        self._client_id = config.client_id
+                        self._is_logged_in = True
+                        print(f"✅ Restored and validated broker session for {config.client_id}")
+                    else:
+                        print(f"⚠️ Saved session for {config.client_id} is invalid, need re-login")
+                        self.smart_api = None
+                except Exception as validation_error:
+                    print(f"⚠️ Session validation failed: {validation_error}")
+                    self.smart_api = None
+                
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"⚠️ Failed to restore broker session: {e}")
+            # Not a critical error - user can re-login
     
     @property
     def is_logged_in(self) -> bool:
@@ -185,24 +234,97 @@ class AngelOneBrokerService(BrokerInterface):
                 self._client_id = client_id
                 self._is_logged_in = True
                 
-                # Update database
+                # Update database and save session tokens
                 db = SessionLocal()
                 try:
+                    from app.core.encryption import get_encryption_manager
+                    from datetime import timedelta
+                    
+                    # Get encryption manager
+                    encryption_manager = get_encryption_manager()
+                    
+                    # Find config by broker_name and client_id for accuracy
                     config = db.query(BrokerConfig).filter(
+                        BrokerConfig.broker_name == 'angel_one',
                         BrokerConfig.client_id == client_id
                     ).first()
+                    
+                    # Fallback: try just by client_id if not found
+                    if not config:
+                        config = db.query(BrokerConfig).filter(
+                            BrokerConfig.client_id == client_id
+                        ).first()
                     
                     if config:
                         config.is_active = True
                         config.last_login = datetime.utcnow()
+                        
+                        # Save encrypted session tokens for persistence
+                        tokens_saved = []
+                        
+                        # Debug: Log the full response structure
+                        print(f"📊 Login response: {data}")
+                        
+                        # Extract tokens from various possible locations in the response
+                        token_source = None
+                        
+                        # Check nested 'data' first (most common)
+                        if 'data' in data and isinstance(data['data'], dict) and data['data']:
+                            token_source = data['data']
+                            print(f"📊 Using nested data for tokens: {list(token_source.keys())}")
+                        # Check top level
+                        elif 'jwtToken' in data:
+                            token_source = data
+                            print(f"📊 Using top-level data for tokens")
+                        
+                        # Also try to get tokens directly from SmartAPI object
+                        if not token_source or 'jwtToken' not in token_source:
+                            if hasattr(self.smart_api, 'access_token') and self.smart_api.access_token:
+                                token_source = token_source or {}
+                                token_source['jwtToken'] = self.smart_api.access_token
+                                print(f"📊 Got jwtToken from SmartAPI object")
+                            if hasattr(self.smart_api, 'refresh_token') and self.smart_api.refresh_token:
+                                token_source = token_source or {}
+                                token_source['refreshToken'] = self.smart_api.refresh_token
+                                print(f"📊 Got refreshToken from SmartAPI object")
+                            if hasattr(self.smart_api, 'feed_token') and self.smart_api.feed_token:
+                                token_source = token_source or {}
+                                token_source['feedToken'] = self.smart_api.feed_token
+                                print(f"📊 Got feedToken from SmartAPI object")
+                            
+                        if token_source:
+                            if 'jwtToken' in token_source and token_source['jwtToken']:
+                                config.auth_token = encryption_manager.encrypt(token_source['jwtToken'])
+                                tokens_saved.append('auth')
+                            if 'refreshToken' in token_source and token_source['refreshToken']:
+                                config.refresh_token = encryption_manager.encrypt(token_source['refreshToken'])
+                                tokens_saved.append('refresh')
+                            if 'feedToken' in token_source and token_source['feedToken']:
+                                config.feed_token = encryption_manager.encrypt(token_source['feedToken'])
+                                tokens_saved.append('feed')
+                        
+                        if not tokens_saved:
+                            print("⚠️ No tokens could be extracted from response or SmartAPI object")
+                        
+                        # Set expiry (Angel One sessions typically last 24 hours)
+                        config.session_expiry = datetime.utcnow() + timedelta(hours=24)
+                        
                         db.commit()
+                        print(f"✅ Session tokens saved for {client_id}: {tokens_saved}")
+                    else:
+                        print(f"⚠️ No config found for client_id {client_id}, tokens not saved")
+                except Exception as e:
+                    print(f"❌ Error saving session tokens: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    db.rollback()
                 finally:
                     db.close()
                 
                 return {
                     "status": "success",
                     "message": "Logged in successfully",
-                    "data": data['data']
+                    "data": data.get('data', data)
                 }
             else:
                 return {

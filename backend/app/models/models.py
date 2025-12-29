@@ -68,6 +68,11 @@ class BrokerConfig(Base):
     totp_secret = Column(String, nullable=True)  # For Angel One TOTP
     is_active = Column(Boolean, default=False)
     last_login = Column(DateTime, nullable=True)
+    # Session persistence fields
+    auth_token = Column(Text, nullable=True)  # Encrypted auth token for session persistence
+    refresh_token = Column(Text, nullable=True)  # Encrypted refresh token
+    feed_token = Column(Text, nullable=True)  # Encrypted feed token (for websocket)
+    session_expiry = Column(DateTime, nullable=True)  # When the session expires
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -101,7 +106,6 @@ class AppSettings(Base):
     active_broker_type = Column(String, default="angel_one")  # Currently active broker
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class PaperTrade(Base):
     """Store paper/simulated trades for testing"""
@@ -118,7 +122,6 @@ class PaperTrade(Base):
     exchange = Column(String, default="NSE")
     product_type = Column(String, default="INTRADAY")
     broker_type = Column(String, default="angel_one", index=True)  # Simulated broker type
-    product_type = Column(String, default="INTRADAY")
     
     # P&L tracking
     pnl = Column(Float, default=0.0)

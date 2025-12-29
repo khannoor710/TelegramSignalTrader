@@ -165,14 +165,15 @@ class RegexSignalParser:
     EXCLUDED_WORDS = {'BUY', 'SELL', 'TARGET', 'TGT', 'SL', 'QTY', 'QUANTITY', 'PRICE', 
                       'ENTRY', 'EXIT', 'STOP', 'LOSS', 'AT', 'RS', 'INR', 'NSE', 'BSE',
                       'NFO', 'MCX', 'CDS', 'MARKET', 'LIMIT', 'INTRADAY', 'DELIVERY',
-                      'TP', 'CE', 'PE', 'CALL', 'PUT', 'ABOVE', 'BELOW', 'AROUND', 'NEAR'}
+                      'TP', 'CE', 'PE', 'CALL', 'PUT', 'ABOVE', 'BELOW', 'AROUND', 'NEAR',
+                      'ABV', 'BLW'}
     
     def __init__(self):
         self.patterns = {
             'symbol': r'\b([A-Z][A-Z0-9]{1,15})\b',
-            'buy': r'\b(?:BUY|buy|Buy)\b',
-            'sell': r'\b(?:SELL|sell|Sell)\b',
-            'price': r'(?:@|at|price|entry|above|below)\s*:?\s*(?:Rs\.?\s*)?(\d+(?:\.\d{1,2})?)',
+            'buy': r'\b(?:BUY|buy|Buy|ABV|abv|Abv)\b',  # ABV (above) implies BUY
+            'sell': r'\b(?:SELL|sell|Sell|BLW|blw|Blw)\b',  # BLW (below) implies SELL
+            'price': r'(?:@|at|price|entry|above|below|abv|blw)\s*:?\s*(?:Rs\.?\s*)?(\d+(?:\.\d{1,2})?)',
             'target': r'(?:target|tgt|tp|t1|t2)\s*:?\s*(?:Rs\.?\s*)?(\d+(?:\.\d{1,2})?)',
             'stop_loss': r'(?:sl|stop\s*loss|stoploss)\s*:?\s*(?:Rs\.?\s*)?(\d+(?:\.\d{1,2})?)',
             'quantity': r'(?:qty|quantity|lot)\s*:?\s*(\d+)',

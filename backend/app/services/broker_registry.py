@@ -29,6 +29,29 @@ class BrokerRegistry:
         self._brokers: Dict[str, Type[BrokerInterface]] = {}
         self._instances: Dict[str, BrokerInterface] = {}
         self._default_broker: Optional[str] = None
+        # Register default brokers
+        self._register_defaults()
+
+    def _register_defaults(self):
+        """Register default broker implementations"""
+        # Import inside method to avoid circular imports
+        try:
+            from app.services.broker_service import AngelOneBrokerService
+            self.register(BrokerType.ANGEL_ONE.value, AngelOneBrokerService)
+        except ImportError as e:
+            print(f"⚠️ Could not register Angel One: {e}")
+            
+        try:
+            from app.services.zerodha_broker_service import ZerodhaBrokerService
+            self.register(BrokerType.ZERODHA.value, ZerodhaBrokerService)
+        except ImportError as e:
+            print(f"⚠️ Could not register Zerodha: {e}")
+
+        try:
+            from app.services.shoonya_broker_service import ShoonyaBrokerService
+            self.register(BrokerType.SHOONYA.value, ShoonyaBrokerService)
+        except ImportError as e:
+            print(f"⚠️ Could not register Shoonya: {e}")
     
     def register(self, broker_type: str, broker_class: Type[BrokerInterface]) -> None:
         """
@@ -103,6 +126,39 @@ class BrokerRegistry:
         if cache and broker_type in self._instances:
             return self._instances[broker_type]
         
+        # For angel_one, use the global broker_service instance to maintain consistency
+        # with legacy endpoints that use broker_service directly
+        if broker_type == BrokerType.ANGEL_ONE.value:
+            try:
+                from app.services.broker_service import broker_service
+                if cache:
+                    self._instances[broker_type] = broker_service
+                return broker_service
+            except ImportError:
+                pass  # Fall through to create new instance
+        
+        # For zerodha, use the global instance if available
+        if broker_type == BrokerType.ZERODHA.value:
+            try:
+                from app.services.zerodha_broker_service import zerodha_broker_service
+                if zerodha_broker_service is not None:
+                    if cache:
+                        self._instances[broker_type] = zerodha_broker_service
+                    return zerodha_broker_service
+            except ImportError:
+                pass  # Fall through to create new instance
+        
+        # For shoonya, use the global instance if available
+        if broker_type == BrokerType.SHOONYA.value:
+            try:
+                from app.services.shoonya_broker_service import shoonya_broker_service
+                if shoonya_broker_service is not None:
+                    if cache:
+                        self._instances[broker_type] = shoonya_broker_service
+                    return shoonya_broker_service
+            except ImportError:
+                pass  # Fall through to create new instance
+        
         # Create new instance
         broker_class = self.get_broker_class(broker_type)
         instance = broker_class()
@@ -172,13 +228,17 @@ class BrokerRegistry:
                 "is_registered": config.broker_name in self._brokers
             }
             
-            # Add login status if broker is instantiated
-            if config.broker_name in self._instances:
-                broker = self._instances[config.broker_name]
-                broker_info["is_logged_in"] = broker.is_logged_in
-            else:
-                broker_info["is_logged_in"] = False
+            # Determine login status - use create_broker to get the correct instance
+            is_logged_in = False
             
+            try:
+                if config.broker_name in self._brokers:
+                    broker = self.create_broker(config.broker_name, cache=True)
+                    is_logged_in = broker.is_logged_in
+            except Exception:
+                pass  # If broker can't be created, it's not logged in
+            
+            broker_info["is_logged_in"] = is_logged_in
             result.append(broker_info)
         
         return result

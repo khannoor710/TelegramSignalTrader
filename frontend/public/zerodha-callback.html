@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zerodha Login - Success</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .container {
+            background: white;
+            padding: 3rem;
+            border-radius: 1rem;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 500px;
+            text-align: center;
+        }
+        .icon {
+            font-size: 4rem;
+            margin-bottom: 1rem;
+        }
+        h1 {
+            color: #1a202c;
+            margin-bottom: 1rem;
+        }
+        .token-box {
+            background: #f7fafc;
+            border: 2px solid #387ed1;
+            border-radius: 0.5rem;
+            padding: 1rem;
+            margin: 1.5rem 0;
+            word-break: break-all;
+            font-family: monospace;
+            font-size: 0.9rem;
+        }
+        .instructions {
+            text-align: left;
+            background: #fef3c7;
+            border-left: 4px solid #fbbf24;
+            padding: 1rem;
+            margin: 1.5rem 0;
+            border-radius: 0.25rem;
+        }
+        .instructions ol {
+            margin: 0.5rem 0;
+            padding-left: 1.5rem;
+        }
+        .instructions li {
+            margin: 0.5rem 0;
+        }
+        button {
+            background: #387ed1;
+            color: white;
+            border: none;
+            padding: 0.75rem 2rem;
+            border-radius: 0.5rem;
+            font-size: 1rem;
+            cursor: pointer;
+            margin: 0.5rem;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #2c5aa0;
+        }
+        .btn-secondary {
+            background: #48bb78;
+        }
+        .btn-secondary:hover {
+            background: #38a169;
+        }
+        .error {
+            color: #e53e3e;
+            margin-top: 1rem;
+        }
+        .success {
+            color: #38a169;
+            margin-top: 1rem;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">🪁</div>
+        <h1>Zerodha Login Successful!</h1>
+        <p>Your request token has been captured.</p>
+        
+        <div class="token-box" id="tokenDisplay">
+            Loading token...
+        </div>
+
+        <div class="instructions">
+            <strong>⚡ Quick Complete:</strong>
+            <ol>
+                <li>Click <strong>"Auto-Complete Login"</strong> below</li>
+                <li>Or manually copy the token and paste it in the app</li>
+            </ol>
+        </div>
+
+        <button class="btn-secondary" onclick="autoCompleteLogin()">
+            ⚡ Auto-Complete Login
+        </button>
+        <button onclick="copyToken()">
+            📋 Copy Token
+        </button>
+
+        <div id="message"></div>
+    </div>
+
+    <script>
+        // Extract request_token from URL
+        const urlParams = new URLSearchParams(window.location.search);
+        const requestToken = urlParams.get('request_token');
+        const status = urlParams.get('status');
+
+        // Display token
+        if (requestToken) {
+            document.getElementById('tokenDisplay').textContent = requestToken;
+        } else {
+            document.getElementById('tokenDisplay').innerHTML = '<span class="error">No token found in URL</span>';
+        }
+
+        // Copy token to clipboard
+        function copyToken() {
+            if (!requestToken) {
+                showMessage('No token to copy!', 'error');
+                return;
+            }
+            
+            navigator.clipboard.writeText(requestToken)
+                .then(() => {
+                    showMessage('✅ Token copied to clipboard!', 'success');
+                })
+                .catch(() => {
+                    showMessage('❌ Failed to copy. Please copy manually.', 'error');
+                });
+        }
+
+        // Auto-complete login by calling the backend API
+        async function autoCompleteLogin() {
+            if (!requestToken) {
+                showMessage('❌ No token available!', 'error');
+                return;
+            }
+
+            const messageDiv = document.getElementById('message');
+            messageDiv.innerHTML = '<div>⏳ Completing login...</div>';
+
+            try {
+                const response = await fetch(`http://localhost:8000/api/broker/zerodha/complete-login?request_token=${requestToken}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.status === 'success') {
+                    showMessage('✅ Login completed! You can close this window and return to the app.', 'success');
+                    // Redirect to main app after 2 seconds
+                    setTimeout(() => {
+                        window.location.href = 'http://localhost:5173/multi-broker';
+                    }, 2000);
+                } else {
+                    showMessage('❌ Login failed: ' + (data.message || data.detail || 'Unknown error'), 'error');
+                }
+            } catch (error) {
+                showMessage('❌ Error: ' + error.message + '. Make sure the backend is running on localhost:8000', 'error');
+            }
+        }
+
+        function showMessage(msg, type) {
+            const messageDiv = document.getElementById('message');
+            messageDiv.innerHTML = `<div class="${type}">${msg}</div>`;
+        }
+
+        // Check if status indicates success
+        if (status !== 'success') {
+            showMessage('⚠️ Login may have failed. Check the status parameter.', 'error');
+        }
+    </script>
+</body>
+</html>

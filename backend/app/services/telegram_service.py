@@ -3,8 +3,9 @@ Telegram service for reading messages from groups
 """
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import json
+import asyncio
 from datetime import datetime
 
 from app.core.database import SessionLocal
@@ -23,10 +24,17 @@ class TelegramService:
         self.signal_parser = SignalParser()
         self.monitored_chats: List[str] = []
         self.is_connected = False
+        self.last_message_time: Optional[datetime] = None
+        self.connection_error: Optional[str] = None
+        self._reconnect_task: Optional[asyncio.Task] = None
+        self._config_id: Optional[int] = None
+        self._message_handler = None  # Store reference to handler for removal
         
     async def initialize(self, api_id: str, api_hash: str, phone: str, session_string: Optional[str] = None):
         """Initialize Telegram client"""
         try:
+            self.connection_error = None
+            
             if session_string:
                 self.client = TelegramClient(StringSession(session_string), api_id, api_hash)
             else:
@@ -36,14 +44,27 @@ class TelegramService:
             
             if not await self.client.is_user_authorized():
                 await self.client.send_code_request(phone)
-                return {"status": "code_sent", "message": "Verification code sent to your phone"}
+                return {
+                    "status": "code_sent", 
+                    "message": "Verification code sent to your Telegram app",
+                    "phone": phone
+                }
             
             self.is_connected = True
-            return {"status": "authorized", "message": "Already authorized"}
+            # Broadcast connection status
+            await self._broadcast_status_update()
+            return {
+                "status": "authorized", 
+                "message": "Already authorized and connected",
+                "is_connected": True
+            }
             
         except Exception as e:
+            error_msg = str(e)
+            self.connection_error = error_msg
             logger.error(f"Error initializing Telegram client: {e}")
-            return {"status": "error", "message": str(e)}
+            await self._broadcast_status_update()
+            return {"status": "error", "message": self._get_user_friendly_error(error_msg)}
     
     async def verify_code(self, phone: str, code: str):
         """Verify the code sent to phone"""
@@ -51,10 +72,47 @@ class TelegramService:
             await self.client.sign_in(phone, code)
             session_string = self.client.session.save()
             self.is_connected = True
-            return {"status": "success", "session_string": session_string}
+            self.connection_error = None
+            await self._broadcast_status_update()
+            return {
+                "status": "success", 
+                "session_string": session_string,
+                "message": "Successfully verified! You can now select channels to monitor."
+            }
         except Exception as e:
+            error_msg = str(e)
+            self.connection_error = error_msg
             logger.error(f"Error verifying code: {e}")
-            return {"status": "error", "message": str(e)}
+            return {"status": "error", "message": self._get_user_friendly_error(error_msg)}
+    
+    def _get_user_friendly_error(self, error: str) -> str:
+        """Convert technical errors to user-friendly messages"""
+        error_lower = error.lower()
+        
+        if "api_id" in error_lower or "api_hash" in error_lower:
+            return "Invalid API credentials. Please check your API ID and API Hash from my.telegram.org"
+        elif "phone" in error_lower:
+            return "Invalid phone number format. Use international format like +911234567890"
+        elif "code" in error_lower or "invalid" in error_lower:
+            return "Invalid verification code. Please try again with the code from your Telegram app"
+        elif "flood" in error_lower:
+            return "Too many attempts. Please wait a few minutes before trying again"
+        elif "network" in error_lower or "connection" in error_lower:
+            return "Network error. Please check your internet connection"
+        elif "session" in error_lower:
+            return "Session expired. Please re-authenticate with your phone number"
+        else:
+            return f"Error: {error}"
+    
+    async def _broadcast_status_update(self):
+        """Broadcast connection status to all WebSocket clients"""
+        try:
+            await self.ws_manager.broadcast({
+                "type": "telegram_status",
+                "data": self.get_connection_status()
+            })
+        except Exception as e:
+            logger.error(f"Error broadcasting status update: {e}")
     
     async def start(self):
         """Start the Telegram service"""
@@ -63,6 +121,16 @@ class TelegramService:
             config = db.query(TelegramConfig).filter(TelegramConfig.is_active).first()
             if not config:
                 logger.warning("No active Telegram configuration found")
+                self.connection_error = "No Telegram configuration found. Please set up Telegram credentials."
+                await self._broadcast_status_update()
+                return
+            
+            self._config_id = config.id
+            
+            if not config.session_string:
+                logger.warning("No session string found - user needs to authenticate")
+                self.connection_error = "Not authenticated. Please verify your phone number."
+                await self._broadcast_status_update()
                 return
             
             if config.session_string:
@@ -73,47 +141,131 @@ class TelegramService:
                 )
                 await self.client.connect()
                 
-                # Parse monitored chats - convert to integers for Telethon
+                # Check if still authorized
+                if not await self.client.is_user_authorized():
+                    logger.warning("Session expired - user needs to re-authenticate")
+                    self.connection_error = "Session expired. Please re-authenticate."
+                    self.is_connected = False
+                    await self._broadcast_status_update()
+                    return
+                
+                # Parse monitored chats - keep as strings initially, convert to int for Telethon
                 raw_chats = json.loads(config.monitored_chats) if config.monitored_chats else []
-                self.monitored_chats = [int(chat_id) for chat_id in raw_chats]
+                # Store as strings for status reporting
+                self.monitored_chats = [str(chat_id) for chat_id in raw_chats]
+                # Convert to integers for Telethon's event handler
+                chats_to_monitor = [int(chat_id) for chat_id in raw_chats] if raw_chats else None
                 
-                # Set up message handler - use None if no chats to monitor ALL
-                chats_to_monitor = self.monitored_chats if self.monitored_chats else None
-                
-                @self.client.on(events.NewMessage(chats=chats_to_monitor))
+                # Define and register message handler
                 async def message_handler(event):
                     await self.handle_new_message(event)
                 
+                self._message_handler = message_handler
+                self.client.add_event_handler(message_handler, events.NewMessage(chats=chats_to_monitor))
+                
                 await self.client.start()
                 self.is_connected = True
-                logger.info(f"Telegram client connected, monitoring {len(self.monitored_chats)} chats: {self.monitored_chats}")
+                self.connection_error = None
+                
+                # Log helpful status
+                if self.monitored_chats:
+                    logger.info(f"✅ Telegram client connected, monitoring {len(self.monitored_chats)} chats: {self.monitored_chats}")
+                else:
+                    logger.info("⚠️ Telegram client connected, but NO chats are being monitored. Select channels in the UI.")
+                
+                await self._broadcast_status_update()
                 
         except Exception as e:
+            self.connection_error = self._get_user_friendly_error(str(e))
+            self.is_connected = False
             logger.error(f"Error starting Telegram service: {e}")
+            await self._broadcast_status_update()
         finally:
             db.close()
     
     async def reload(self):
         """Reload Telegram service with updated configuration"""
-        logger.info("Reloading Telegram service...")
-        await self.stop()
-        await self.start()
-        return self.get_connection_status()
+        logger.info("🔄 Reloading Telegram service configuration...")
+        db = SessionLocal()
+        try:
+            if not self.client or not self.is_connected:
+                logger.warning("Client not connected, performing full start instead of reload")
+                await self.start()
+                return self.get_connection_status()
+            
+            # Get updated config from database
+            config = db.query(TelegramConfig).filter(TelegramConfig.is_active).first()
+            if not config:
+                logger.warning("No active Telegram configuration found")
+                return self.get_connection_status()
+            
+            # Update monitored chats list
+            raw_chats = json.loads(config.monitored_chats) if config.monitored_chats else []
+            old_count = len(self.monitored_chats)
+            self.monitored_chats = [str(chat_id) for chat_id in raw_chats]
+            new_count = len(self.monitored_chats)
+            
+            logger.info(f"📊 Monitored chats updated: {old_count} -> {new_count}")
+            logger.info(f"   Chat IDs: {self.monitored_chats}")
+            
+            # Remove old event handler if it exists
+            if self._message_handler:
+                try:
+                    self.client.remove_event_handler(self._message_handler)
+                    logger.info("✅ Removed old message handler")
+                except Exception as e:
+                    logger.warning(f"Could not remove old handler: {e}")
+            
+            # Register new message handler with updated chat list
+            chats_to_monitor = [int(chat_id) for chat_id in raw_chats] if raw_chats else None
+            
+            async def message_handler(event):
+                await self.handle_new_message(event)
+            
+            self._message_handler = message_handler
+            self.client.add_event_handler(message_handler, events.NewMessage(chats=chats_to_monitor))
+            
+            logger.info(f"✅ Telegram service reloaded - now monitoring {new_count} chats")
+            if new_count == 0:
+                logger.warning("⚠️  No chats being monitored! Select channels to receive messages.")
+            
+            await self._broadcast_status_update()
+            return self.get_connection_status()
+            
+        except Exception as e:
+            error_msg = str(e)
+            self.connection_error = self._get_user_friendly_error(error_msg)
+            logger.error(f"❌ Error reloading Telegram service: {e}", exc_info=True)
+            await self._broadcast_status_update()
+            return self.get_connection_status()
+        finally:
+            db.close()
     
     async def stop(self):
         """Stop the Telegram service"""
         if self.client:
-            await self.client.disconnect()
+            try:
+                await self.client.disconnect()
+            except Exception as e:
+                logger.error(f"Error disconnecting client: {e}")
             self.is_connected = False
             logger.info("Telegram client disconnected")
+            await self._broadcast_status_update()
     
     def get_connection_status(self) -> dict:
-        """Get current connection status"""
-        return {
+        """Get current connection status with detailed info"""
+        status = {
             "is_connected": self.is_connected,
             "client_initialized": self.client is not None,
-            "monitored_chats_count": len(self.monitored_chats)
+            "monitored_chats_count": len(self.monitored_chats),
+            "monitored_chats": self.monitored_chats,
+            "last_message_time": self.last_message_time.isoformat() if self.last_message_time else None,
+            "error": self.connection_error,
+            "needs_setup": not self.client,
+            "needs_auth": self.client is not None and not self.is_connected and "authenticate" in (self.connection_error or "").lower(),
+            "needs_channels": self.is_connected and len(self.monitored_chats) == 0
         }
+        return status
     
     async def handle_new_message(self, event):
         """Handle new message from monitored chats"""
@@ -125,6 +277,9 @@ class TelegramService:
             chat_name = getattr(chat, 'title', str(event.chat_id))
             sender_name = getattr(sender, 'username', None) or getattr(sender, 'first_name', 'Unknown')
             message_text = event.message.text or ""
+            
+            # Update last message time
+            self.last_message_time = datetime.utcnow()
             
             # Store message in database
             message = TelegramMessage(
@@ -163,7 +318,20 @@ class TelegramService:
                 }
             })
             
-            logger.info(f"New message from {chat_name}: {message_text[:50]}...")
+            # If it's a signal, also broadcast a signal-specific event for notifications
+            if parsed_signal:
+                await self.ws_manager.broadcast({
+                    "type": "new_signal",
+                    "data": {
+                        "id": message.id,
+                        "symbol": parsed_signal.get('symbol'),
+                        "action": parsed_signal.get('action'),
+                        "chat_name": chat_name,
+                        "message": f"New {parsed_signal.get('action')} signal for {parsed_signal.get('symbol')} from {chat_name}"
+                    }
+                })
+            
+            logger.info(f"📨 New message from {chat_name}: {message_text[:50]}..." if len(message_text) > 50 else f"📨 New message from {chat_name}: {message_text}")
             
         except Exception as e:
             logger.error(f"Error handling message: {e}")

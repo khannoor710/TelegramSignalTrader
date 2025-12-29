@@ -8,12 +8,10 @@ Supports:
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from cryptography.fernet import Fernet
-from pathlib import Path
-import os
 from typing import Optional
 
 from app.core.database import get_db
+from app.core.encryption import get_encryption_manager
 from app.schemas.schemas import (
     BrokerConfigCreate,
     BrokerConfigResponse
@@ -24,32 +22,8 @@ from app.services.broker_service import broker_service
 
 router = APIRouter()
 
-# Encryption key for storing credentials
-# In production, set ENCRYPTION_KEY env var to a stable Fernet key
-# Generate one with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-def get_encryption_key():
-    """Get or create a stable encryption key"""
-    key_file = Path(__file__).parent.parent.parent / "data" / ".encryption_key"
-    env_key = os.getenv("ENCRYPTION_KEY")
-    
-    if env_key:
-        # Use environment variable if set
-        if isinstance(env_key, str) and len(env_key) == 44:
-            return env_key.encode()
-        return env_key if isinstance(env_key, bytes) else Fernet.generate_key()
-    
-    # Try to load from file for persistence across restarts
-    key_file.parent.mkdir(parents=True, exist_ok=True)
-    if key_file.exists():
-        return key_file.read_bytes()
-    
-    # Generate new key and save it
-    new_key = Fernet.generate_key()
-    key_file.write_bytes(new_key)
-    return new_key
-
-ENCRYPTION_KEY = get_encryption_key()
-cipher = Fernet(ENCRYPTION_KEY)
+# Get encryption manager for credential encryption/decryption
+encryption_manager = get_encryption_manager()
 
 
 @router.post("/config", response_model=BrokerConfigResponse)
@@ -71,17 +45,17 @@ async def create_broker_config(config: BrokerConfigCreate, db: Session = Depends
         )
     
     # Encrypt PIN/password
-    encrypted_pin = cipher.encrypt(config.pin.encode()).decode()
+    encrypted_pin = encryption_manager.encrypt(config.pin)
     
     # Encrypt TOTP secret if provided
     encrypted_totp = None
     if config.totp_secret:
-        encrypted_totp = cipher.encrypt(config.totp_secret.encode()).decode()
+        encrypted_totp = encryption_manager.encrypt(config.totp_secret)
     
     # Encrypt API secret if provided (for Zerodha, Upstox, etc.)
     encrypted_api_secret = None
     if config.api_secret:
-        encrypted_api_secret = cipher.encrypt(config.api_secret.encode()).decode()
+        encrypted_api_secret = encryption_manager.encrypt(config.api_secret)
     
     # Check if config already exists for this broker
     existing = db.query(BrokerConfig).filter(
@@ -205,15 +179,29 @@ async def broker_login(db: Session = Depends(get_db)):
             detail="TOTP secret not configured. Please update configuration with TOTP secret for auto-login."
         )
     # Decrypt credentials
-    decrypted_pin = cipher.decrypt(config.password_encrypted.encode()).decode()
-    decrypted_totp_secret = cipher.decrypt(config.totp_secret.encode()).decode()
+    try:
+        decrypted_pin = encryption_manager.decrypt(config.password_encrypted)
+        decrypted_totp_secret = encryption_manager.decrypt(config.totp_secret)
+    except Exception as e:
+        print(f"❌ Auto-login decryption failed: {e}")
+        config.is_active = False
+        db.commit()
+        raise HTTPException(
+            status_code=400,
+            detail="Configuration invalid (decryption failed). Please re-configure broker."
+        )
+
     # Login with auto-generated TOTP
-    result = broker_service.login(
-        api_key=config.api_key,
-        client_id=config.client_id,
-        password=decrypted_pin,
-        totp_secret=decrypted_totp_secret
-    )
+    try:
+        result = broker_service.login(
+            api_key=config.api_key,
+            client_id=config.client_id,
+            password=decrypted_pin,
+            totp_secret=decrypted_totp_secret
+        )
+    except Exception as e:
+         raise HTTPException(status_code=500, detail=f"Login process failed: {str(e)}")
+
     if result['status'] == 'success':
         return result
     else:
@@ -228,47 +216,136 @@ async def broker_logout():
 
 
 @router.get("/status")
-async def broker_status():
-    """Get broker connection status"""
+async def broker_status(db: Session = Depends(get_db)):
+    """Get broker connection status from active broker"""
+    # Get active broker
+    settings = db.query(AppSettings).first()
+    if not settings or not settings.active_broker_type:
+        # Fallback to legacy Angel One broker
+        return {
+            "is_logged_in": broker_service.is_logged_in,
+            "client_id": broker_service.client_id,
+            "broker_type": "angel_one"
+        }
+    
+    # Use active broker
+    broker = broker_registry.create_broker(settings.active_broker_type)
+    
+    # For Zerodha, need to restore session
+    if settings.active_broker_type == "zerodha":
+        config = db.query(BrokerConfig).filter(
+            BrokerConfig.broker_name == 'zerodha'
+        ).first()
+        
+        if config and not broker.is_logged_in:
+            # Try to restore session
+            try:
+                decrypted_token = encryption_manager.decrypt(config.password_encrypted)
+                broker.login(
+                    api_key=config.api_key,
+                    client_id=config.client_id,
+                    password=decrypted_token,
+                    totp_secret=None
+                )
+            except:
+                pass  # Restoration failed, will show as not logged in
+    
     return {
-        "is_logged_in": broker_service.is_logged_in,
-        "client_id": broker_service.client_id
+        "is_logged_in": broker.is_logged_in,
+        "client_id": broker.client_id,
+        "broker_type": settings.active_broker_type
     }
 
 
 @router.get("/positions")
-async def get_positions():
-    """Get current positions"""
-    result = broker_service.get_positions()
+async def get_positions(db: Session = Depends(get_db)):
+    """Get current positions from active broker"""
+    # Get active broker
+    settings = db.query(AppSettings).first()
+    if not settings or not settings.active_broker_type:
+        # Fallback to legacy Angel One broker
+        result = broker_service.get_positions()
+        if result.get('status') == 'error':
+            raise HTTPException(status_code=400, detail=result.get('message', 'Not logged in'))
+        return result
+    
+    # Use active broker
+    broker = broker_registry.create_broker(settings.active_broker_type)
+    if not broker.is_logged_in:
+        raise HTTPException(status_code=401, detail="Broker not logged in")
+    
+    result = broker.get_positions()
     if result.get('status') == 'error':
-        raise HTTPException(status_code=400, detail=result['message'])
+        raise HTTPException(status_code=400, detail=result.get('message', 'Failed to fetch positions'))
     return result
 
 
 @router.get("/holdings")
-async def get_holdings():
-    """Get long-term holdings (delivery stocks)"""
-    result = broker_service.get_holdings()
+async def get_holdings(db: Session = Depends(get_db)):
+    """Get long-term holdings (delivery stocks) from active broker"""
+    # Get active broker
+    settings = db.query(AppSettings).first()
+    if not settings or not settings.active_broker_type:
+        # Fallback to legacy Angel One broker
+        result = broker_service.get_holdings()
+        if result.get('status') == 'error':
+            raise HTTPException(status_code=400, detail=result.get('message', 'Not logged in'))
+        return result
+    
+    # Use active broker
+    broker = broker_registry.create_broker(settings.active_broker_type)
+    if not broker.is_logged_in:
+        raise HTTPException(status_code=401, detail="Broker not logged in")
+    
+    result = broker.get_holdings()
     if result.get('status') == 'error':
-        raise HTTPException(status_code=400, detail=result['message'])
+        raise HTTPException(status_code=400, detail=result.get('message', 'Failed to fetch holdings'))
     return result
 
 
 @router.get("/orders")
-async def get_order_book():
-    """Get all orders for today"""
-    result = broker_service.get_order_book()
+async def get_order_book(db: Session = Depends(get_db)):
+    """Get all orders for today from active broker"""
+    # Get active broker
+    settings = db.query(AppSettings).first()
+    if not settings or not settings.active_broker_type:
+        # Fallback to legacy Angel One broker
+        result = broker_service.get_order_book()
+        if result.get('status') == 'error':
+            raise HTTPException(status_code=400, detail=result.get('message', 'Not logged in'))
+        return result
+    
+    # Use active broker
+    broker = broker_registry.create_broker(settings.active_broker_type)
+    if not broker.is_logged_in:
+        raise HTTPException(status_code=401, detail="Broker not logged in")
+    
+    result = broker.get_order_book()
     if result.get('status') == 'error':
-        raise HTTPException(status_code=400, detail=result['message'])
+        raise HTTPException(status_code=400, detail=result.get('message', 'Failed to fetch orders'))
     return result
 
 
 @router.get("/funds")
-async def get_funds():
-    """Get account funds and margin"""
-    result = broker_service.get_funds()
+async def get_funds(db: Session = Depends(get_db)):
+    """Get account funds and margin from active broker"""
+    # Get active broker
+    settings = db.query(AppSettings).first()
+    if not settings or not settings.active_broker_type:
+        # Fallback to legacy Angel One broker
+        result = broker_service.get_funds()
+        if result.get('status') == 'error':
+            raise HTTPException(status_code=400, detail=result.get('message', 'Not logged in'))
+        return result
+    
+    # Use active broker
+    broker = broker_registry.create_broker(settings.active_broker_type)
+    if not broker.is_logged_in:
+        raise HTTPException(status_code=401, detail="Broker not logged in")
+    
+    result = broker.get_funds()
     if result.get('status') == 'error':
-        raise HTTPException(status_code=400, detail=result['message'])
+        raise HTTPException(status_code=400, detail=result.get('message', 'Failed to fetch funds'))
     return result
 
 
@@ -411,30 +488,50 @@ async def login_specific_broker(broker_type: str, db: Session = Depends(get_db))
         )
     
     # Decrypt credentials
-    decrypted_pin = cipher.decrypt(config.password_encrypted.encode()).decode()
-    decrypted_totp_secret = None
-    decrypted_api_secret = None
-    
-    if config.totp_secret:
-        decrypted_totp_secret = cipher.decrypt(config.totp_secret.encode()).decode()
-    
-    if config.api_secret:
-        decrypted_api_secret = cipher.decrypt(config.api_secret.encode()).decode()
+    try:
+        decrypted_pin = encryption_manager.decrypt(config.password_encrypted)
+        decrypted_totp_secret = None
+        decrypted_api_secret = None
+        
+        if config.totp_secret:
+            decrypted_totp_secret = encryption_manager.decrypt(config.totp_secret)
+        
+        if config.api_secret:
+            decrypted_api_secret = encryption_manager.decrypt(config.api_secret)
+    except Exception as e:
+        print(f"❌ Decryption failed for {broker_type}: {e}")
+        # If decryption fails, the config is invalid (key changed?)
+        # Reset the config or ask user to re-configure
+        config.is_active = False
+        db.commit()
+        raise HTTPException(
+            status_code=400,
+            detail="Configuration invalid (decryption failed). Please update your broker configuration."
+        )
     
     # Get broker instance
-    broker = broker_registry.create_broker(broker_type)
+    try:
+        broker = broker_registry.create_broker(broker_type)
+    except Exception as e:
+         raise HTTPException(status_code=500, detail=f"Failed to initialize broker: {str(e)}")
     
-    # Login (API secret reuses totp_secret parameter for Zerodha)
-    if broker_type == "zerodha" and decrypted_api_secret:
-        # For Zerodha, password should be request_token, totp_secret is api_secret
+    # Login with appropriate credentials based on broker type
+    if broker_type == "zerodha":
+        # For Zerodha: try session restoration first (password is access_token)
+        # If that fails and api_secret is available, user needs to do OAuth flow again
         result = broker.login(
             api_key=config.api_key,
             client_id=config.client_id,
-            password=decrypted_pin,  # This would be request_token for Zerodha
-            totp_secret=decrypted_api_secret
+            password=decrypted_pin,  # access_token for restoration
+            totp_secret=None  # No api_secret = session restoration mode
         )
+        
+        # If restoration failed and we have api_secret, it means token expired
+        if result['status'] != 'success' and decrypted_api_secret:
+            result['message'] = "Session expired. Please login again via browser."
+            result['needs_oauth'] = True
     else:
-        # Standard login flow (Angel One)
+        # Standard login flow (Angel One, Shoonya, etc.)
         result = broker.login(
             api_key=config.api_key,
             client_id=config.client_id,
@@ -465,4 +562,88 @@ async def logout_specific_broker(broker_type: str):
         "status": "success",
         "message": f"Logged out from {broker_type}"
     }
+
+
+@router.get("/zerodha/login-url")
+async def get_zerodha_login_url(db: Session = Depends(get_db)):
+    """
+    Get Zerodha OAuth login URL.
+    User must visit this URL in browser to authorize the app.
+    """
+    config = db.query(BrokerConfig).filter(
+        BrokerConfig.broker_name == 'zerodha'
+    ).first()
+    
+    if not config:
+        raise HTTPException(
+            status_code=404,
+            detail="Zerodha not configured. Please add API key and API secret first."
+        )
+    
+    try:
+        from kiteconnect import KiteConnect
+        kite = KiteConnect(api_key=config.api_key)
+        login_url = kite.login_url()
+        
+        return {
+            "status": "success",
+            "login_url": login_url,
+            "message": "Visit this URL to authorize the app"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate login URL: {str(e)}")
+
+
+@router.post("/zerodha/complete-login")
+async def complete_zerodha_login(request_token: str, db: Session = Depends(get_db)):
+    """
+    Complete Zerodha login using request_token from OAuth redirect.
+    
+    After user authorizes the app, Zerodha redirects to:
+    http://127.0.0.1/?request_token=XXXXXX&action=login&status=success
+    
+    Copy the request_token and provide it here.
+    """
+    config = db.query(BrokerConfig).filter(
+        BrokerConfig.broker_name == 'zerodha'
+    ).first()
+    
+    if not config:
+        raise HTTPException(status_code=404, detail="Zerodha configuration not found")
+    
+    try:
+        # Decrypt API secret
+        decrypted_api_secret = encryption_manager.decrypt(config.api_secret)
+        
+        # Get broker instance and login
+        broker = broker_registry.create_broker('zerodha')
+        result = broker.login(
+            api_key=config.api_key,
+            client_id=config.client_id,
+            password=request_token,  # request_token from OAuth
+            totp_secret=decrypted_api_secret  # API secret
+        )
+        
+        if result['status'] == 'success':
+            # Update last login and mark as active
+            from datetime import datetime
+            config.last_login = datetime.utcnow()
+            config.is_active = True
+            
+            # Store access token in PIN field for session persistence
+            if 'access_token' in result:
+                encrypted_token = encryption_manager.encrypt(result['access_token'])
+                config.password_encrypted = encrypted_token
+            
+            db.commit()
+            return {
+                "status": "success",
+                "message": "Successfully logged in to Zerodha!",
+                "access_token": result.get('access_token', 'stored')
+            }
+        else:
+            raise HTTPException(status_code=401, detail=result.get('message', 'Login failed'))
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 

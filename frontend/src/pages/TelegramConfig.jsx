@@ -1,6 +1,17 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import axios from 'axios'
 
+// Helper to get WebSocket URL
+const getWebSocketUrl = () => {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const host = window.location.hostname
+  const port = import.meta.env.VITE_API_PORT || '8000'
+  if (host === 'localhost' || host === '127.0.0.1') {
+    return `${protocol}//${host}:${port}/ws`
+  }
+  return `${protocol}//${window.location.host}/ws`
+}
+
 function TelegramConfig() {
   // Configuration state
   const [config, setConfig] = useState({
@@ -10,8 +21,8 @@ function TelegramConfig() {
     monitored_chats: []
   })
   
-  // UI state
-  const [activeTab, setActiveTab] = useState('messages') // 'config', 'messages', 'history'
+  // UI state - Start with config if not set up
+  const [activeTab, setActiveTab] = useState('messages') // Will update based on status
   const [availableChats, setAvailableChats] = useState([])
   const [messages, setMessages] = useState([])
   const [verificationCode, setVerificationCode] = useState('')
@@ -19,6 +30,7 @@ function TelegramConfig() {
   const [loading, setLoading] = useState(false)
   const [connectionStatus, setConnectionStatus] = useState(null)
   const [messageStats, setMessageStats] = useState(null)
+  const [initialLoading, setInitialLoading] = useState(true)
   
   // History fetch state
   const [selectedChatForHistory, setSelectedChatForHistory] = useState('')
@@ -48,17 +60,22 @@ function TelegramConfig() {
   const [tradeLoading, setTradeLoading] = useState(false)
   const [brokerStatus, setBrokerStatus] = useState(null)
   const [tradeResult, setTradeResult] = useState(null)
+  const [error, setError] = useState(null)
   
   // WebSocket
   const wsRef = useRef(null)
   const reconnectTimeoutRef = useRef(null)
 
   useEffect(() => {
-    fetchConfig()
-    fetchMessages()
-    fetchConnectionStatus()
-    fetchMessageStats()
-    connectWebSocket()
+    const initializeData = async () => {
+      await fetchConfig()
+      await fetchConnectionStatus()
+      await fetchMessageStats()
+      await fetchMessages(true) // Show loading on initial fetch
+      connectWebSocket()
+    }
+    
+    initializeData()
     
     // Cleanup
     return () => {
@@ -71,19 +88,35 @@ function TelegramConfig() {
     }
   }, [])
 
-  // Auto-refresh messages every 30 seconds
+  // Determine initial tab based on setup status
   useEffect(() => {
+    if (connectionStatus !== null) {
+      setInitialLoading(false)
+      // If not connected, show config tab first
+      if (!connectionStatus.is_connected && !connectionStatus.client_initialized) {
+        setActiveTab('config')
+      } else if (connectionStatus.is_connected && connectionStatus.monitored_chats_count === 0) {
+        // Connected but no channels selected
+        setActiveTab('config')
+      }
+    }
+  }, [connectionStatus])
+
+  // Auto-refresh messages every 10 seconds when connected
+  useEffect(() => {
+    if (!connectionStatus?.is_connected) return
+    
     const interval = setInterval(() => {
-      fetchMessages()
+      fetchMessages(false) // Don't show loading on auto-refresh
       fetchMessageStats()
-    }, 30000)
+    }, 10000) // Reduced to 10 seconds for faster updates
+    
     return () => clearInterval(interval)
-  }, [filterSignalsOnly, selectedChatFilter])
+  }, [connectionStatus?.is_connected])
 
   const connectWebSocket = useCallback(() => {
     try {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const wsUrl = `${protocol}//localhost:8000/ws`
+      const wsUrl = getWebSocketUrl()
       
       wsRef.current = new WebSocket(wsUrl)
       
@@ -96,8 +129,26 @@ function TelegramConfig() {
           const data = JSON.parse(event.data)
           if (data.type === 'new_message') {
             // Add new message to the top of the list
-            setMessages(prev => [data.data, ...prev.slice(0, 99)])
+            const newMsg = data.data
+            console.log('📨 New message via WebSocket:', newMsg.chat_name, newMsg.message_text?.substring(0, 50))
+            
+            setMessages(prev => {
+              // Check if message already exists to prevent duplicates
+              const exists = prev.some(m => m.message_id === newMsg.message_id && m.chat_id === newMsg.chat_id)
+              if (exists) return prev
+              return [newMsg, ...prev.slice(0, 99)]
+            })
+            
             fetchMessageStats() // Refresh stats
+            
+            // Show notification for new message
+            if (newMsg.parsed_signal) {
+              console.log('🔔 New signal detected!')
+            }
+          } else if (data.type === 'telegram_status') {
+            // Update connection status from WebSocket
+            console.log('📊 Status update:', data.data)
+            setConnectionStatus(data.data)
           }
         } catch (e) {
           console.error('Error parsing WebSocket message:', e)
@@ -154,16 +205,30 @@ function TelegramConfig() {
     }
   }
 
-  const fetchMessages = async () => {
+  const fetchMessages = async (showLoading = false) => {
+    if (showLoading) setLoading(true)
     try {
-      let url = '/api/telegram/messages?limit=50'
+      let url = '/api/telegram/messages?limit=100' // Increased limit
       if (filterSignalsOnly) {
         url += '&unprocessed_only=true'
       }
       const response = await axios.get(url)
-      setMessages(response.data)
+      const fetchedMessages = response.data || []
+      setMessages(fetchedMessages)
+      
+      // Log for debugging
+      console.log(`Fetched ${fetchedMessages.length} messages from backend`)
+      
+      // Show notification if new messages were found
+      if (showLoading && fetchedMessages.length > 0) {
+        const latestMsg = fetchedMessages[0]
+        console.log('Latest message:', latestMsg?.message_text?.substring(0, 50))
+      }
     } catch (error) {
       console.error('Error fetching messages:', error)
+      setError('Failed to fetch messages: ' + (error.response?.data?.detail || error.message))
+    } finally {
+      if (showLoading) setLoading(false)
     }
   }
 
@@ -203,14 +268,18 @@ function TelegramConfig() {
       
       if (initResponse.data.status === 'code_sent') {
         setNeedsVerification(true)
-        alert('Verification code sent to your phone!')
+        // Don't use alert, the UI shows the verification form
       } else if (initResponse.data.status === 'authorized') {
-        alert('Configuration saved successfully!')
-        fetchChats()
-        fetchConnectionStatus()
+        setNeedsVerification(false)
+        await fetchChats()
+        await fetchConnectionStatus()
+        alert('✅ Connected to Telegram! Now select channels to monitor.')
+      } else if (initResponse.data.status === 'error') {
+        alert('❌ ' + (initResponse.data.message || 'Failed to connect'))
       }
     } catch (error) {
-      alert('Error saving configuration: ' + (error.response?.data?.detail || error.message))
+      const errorMsg = error.response?.data?.detail || error.response?.data?.message || error.message
+      alert('❌ Error: ' + errorMsg)
     } finally {
       setLoading(false)
     }
@@ -226,14 +295,17 @@ function TelegramConfig() {
       })
       
       if (response.data.status === 'success') {
-        alert('Verification successful!')
         setNeedsVerification(false)
         setVerificationCode('')
-        fetchChats()
-        fetchConnectionStatus()
+        await fetchChats()
+        await fetchConnectionStatus()
+        alert('✅ ' + (response.data.message || 'Verification successful! Now select channels to monitor.'))
+      } else {
+        alert('❌ ' + (response.data.message || 'Verification failed'))
       }
     } catch (error) {
-      alert('Verification failed: ' + (error.response?.data?.detail || error.message))
+      const errorMsg = error.response?.data?.detail || error.response?.data?.message || error.message
+      alert('❌ Verification failed: ' + errorMsg)
     } finally {
       setLoading(false)
     }
@@ -249,13 +321,36 @@ function TelegramConfig() {
   const updateMonitoredChats = async () => {
     setLoading(true)
     try {
+      // First save the config
       await axios.post('/api/telegram/config', config)
-      // Reload Telegram service to pick up new monitored chats
+      
+      // Give the database a moment to commit
+      await new Promise(resolve => setTimeout(resolve, 100))
+      
+      // Then reload Telegram service to pick up new monitored chats
       const reloadRes = await axios.post('/api/telegram/reload')
-      alert(`Monitored chats updated! Now monitoring ${reloadRes.data.monitored_chats_count} chats.`)
-      fetchConnectionStatus()
+      
+      // Update local connection status
+      setConnectionStatus(reloadRes.data)
+      
+      // Show appropriate message
+      const count = reloadRes.data.monitored_chats_count || 0
+      if (count > 0) {
+        alert(`✅ Now monitoring ${count} channel${count !== 1 ? 's' : ''}! Switching to Live Messages.`)
+        setActiveTab('messages')
+        // Refresh messages to show any new ones
+        fetchMessages()
+      } else {
+        alert('⚠️ Configuration saved, but no channels are selected. Please select at least one channel.')
+      }
+      
+      // Refresh status to ensure UI is in sync
+      await fetchConnectionStatus()
     } catch (error) {
-      alert('Error updating chats: ' + (error.response?.data?.detail || error.message))
+      console.error('Error updating chats:', error)
+      alert('❌ Error: ' + (error.response?.data?.detail || error.message))
+      // Refresh status even on error
+      fetchConnectionStatus()
     } finally {
       setLoading(false)
     }
@@ -356,15 +451,37 @@ function TelegramConfig() {
 
   const renderConnectionBadge = () => {
     if (!connectionStatus) return null
+    
+    // Determine status message and action
+    let statusMessage = ''
+    let actionText = ''
+    
+    if (connectionStatus.is_connected) {
+      if (connectionStatus.monitored_chats_count > 0) {
+        statusMessage = `Connected • Monitoring ${connectionStatus.monitored_chats_count} channels`
+      } else {
+        statusMessage = 'Connected • No channels selected'
+        actionText = 'Select channels below'
+      }
+    } else if (connectionStatus.error) {
+      statusMessage = connectionStatus.error
+    } else {
+      statusMessage = 'Not configured'
+    }
+    
     return (
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
         <div style={{
           display: 'inline-flex',
           alignItems: 'center',
           gap: '0.5rem',
           padding: '0.5rem 1rem',
           borderRadius: '2rem',
-          backgroundColor: connectionStatus.is_connected ? 'var(--success-color)' : 'var(--danger-color)',
+          backgroundColor: connectionStatus.is_connected 
+            ? connectionStatus.monitored_chats_count > 0 
+              ? 'var(--success-color)' 
+              : 'var(--warning-color)'
+            : 'var(--danger-color)',
           color: 'white',
           fontSize: '0.85rem'
         }}>
@@ -375,66 +492,98 @@ function TelegramConfig() {
             backgroundColor: 'white',
             animation: connectionStatus.is_connected ? 'pulse 2s infinite' : 'none'
           }} />
-          {connectionStatus.is_connected ? 'Connected' : 'Disconnected'}
-          {connectionStatus.is_connected && connectionStatus.monitored_chats_count > 0 && (
-            <span>• Monitoring {connectionStatus.monitored_chats_count} chats</span>
-          )}
+          {statusMessage}
         </div>
+        {actionText && (
+          <span style={{ color: 'var(--warning-color)', fontSize: '0.85rem' }}>
+            ⚠️ {actionText}
+          </span>
+        )}
         <button 
           onClick={reloadTelegramService} 
           className="btn" 
           style={{ padding: '0.5rem 0.75rem', fontSize: '0.85rem' }}
           disabled={loading}
+          title="Reload Telegram connection"
         >
-          🔄 Reload
+          🔄 Reconnect
         </button>
       </div>
     )
   }
 
-  const renderTabs = () => (
-    <div style={{
-      display: 'flex',
-      gap: '0.5rem',
-      marginBottom: '1.5rem',
-      borderBottom: '1px solid var(--border-color)',
-      paddingBottom: '0.5rem'
-    }}>
-      {[
-        { id: 'messages', label: '📨 Live Messages', badge: messages.length },
-        { id: 'history', label: '📜 Fetch History' },
-        { id: 'config', label: '⚙️ Configuration' }
-      ].map(tab => (
-        <button
-          key={tab.id}
-          onClick={() => setActiveTab(tab.id)}
-          style={{
-            padding: '0.75rem 1.5rem',
-            border: 'none',
-            borderRadius: '0.5rem 0.5rem 0 0',
-            backgroundColor: activeTab === tab.id ? 'var(--primary-color)' : 'transparent',
-            color: activeTab === tab.id ? 'white' : 'var(--text-color)',
-            cursor: 'pointer',
-            fontWeight: activeTab === tab.id ? 'bold' : 'normal',
-            display: 'flex',
-            alignItems: 'center',
-            gap: '0.5rem'
-          }}
-        >
-          {tab.label}
-          {tab.badge > 0 && (
-            <span style={{
-              backgroundColor: 'var(--secondary-color)',
-              color: 'white',
-              padding: '0.1rem 0.5rem',
-              borderRadius: '1rem',
-              fontSize: '0.75rem'
-            }}>{tab.badge}</span>
-          )}
-        </button>
-      ))}
-    </div>
-  )
+  const renderTabs = () => {
+    // Show warning badges on tabs
+    const configWarning = !connectionStatus?.is_connected || connectionStatus?.monitored_chats_count === 0
+    
+    return (
+      <div style={{
+        display: 'flex',
+        gap: '0.5rem',
+        marginBottom: '1.5rem',
+        borderBottom: '1px solid var(--border-color)',
+        paddingBottom: '0.5rem',
+        flexWrap: 'wrap'
+      }}>
+        {[
+          { 
+            id: 'messages', 
+            label: '📨 Live Messages', 
+            badge: messages.length,
+            disabled: !connectionStatus?.is_connected
+          },
+          { 
+            id: 'history', 
+            label: '📜 Fetch History',
+            disabled: !connectionStatus?.is_connected
+          },
+          { 
+            id: 'config', 
+            label: '⚙️ Configuration',
+            warning: configWarning
+          }
+        ].map(tab => (
+          <button
+            key={tab.id}
+            onClick={() => !tab.disabled && setActiveTab(tab.id)}
+            style={{
+              padding: '0.75rem 1.5rem',
+              border: 'none',
+              borderRadius: '0.5rem 0.5rem 0 0',
+              backgroundColor: activeTab === tab.id ? 'var(--primary-color)' : 'transparent',
+              color: activeTab === tab.id ? 'white' : tab.disabled ? 'var(--text-secondary)' : 'var(--text-color)',
+              cursor: tab.disabled ? 'not-allowed' : 'pointer',
+              fontWeight: activeTab === tab.id ? 'bold' : 'normal',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.5rem',
+              opacity: tab.disabled ? 0.5 : 1
+            }}
+          >
+            {tab.label}
+            {tab.badge > 0 && (
+              <span style={{
+                backgroundColor: 'var(--secondary-color)',
+                color: 'white',
+                padding: '0.1rem 0.5rem',
+                borderRadius: '1rem',
+                fontSize: '0.75rem'
+              }}>{tab.badge}</span>
+            )}
+            {tab.warning && !tab.disabled && (
+              <span style={{
+                backgroundColor: 'var(--warning-color)',
+                color: 'white',
+                padding: '0.1rem 0.4rem',
+                borderRadius: '1rem',
+                fontSize: '0.7rem'
+              }}>!</span>
+            )}
+          </button>
+        ))}
+      </div>
+    )
+  }
 
   const renderStats = () => {
     if (!messageStats) return null
@@ -615,21 +764,80 @@ function TelegramConfig() {
 
   const renderMessagesTab = () => (
     <>
+      {/* Error Banner */}
+      {error && (
+        <div style={{
+          padding: '1rem',
+          backgroundColor: 'rgba(239, 68, 68, 0.1)',
+          border: '1px solid var(--danger-color)',
+          borderRadius: '0.5rem',
+          marginBottom: '1.5rem',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between'
+        }}>
+          <span style={{ color: 'var(--danger-color)' }}>⚠️ {error}</span>
+          <button 
+            onClick={() => setError(null)} 
+            style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '1.2rem', color: 'var(--text-secondary)' }}
+          >
+            ×
+          </button>
+        </div>
+      )}
+    
+      {/* Show warning if not properly configured */}
+      {(!connectionStatus?.is_connected || connectionStatus?.monitored_chats_count === 0) && (
+        <div style={{
+          padding: '1.5rem',
+          backgroundColor: 'rgba(245, 158, 11, 0.1)',
+          border: '1px solid var(--warning-color)',
+          borderRadius: '0.5rem',
+          marginBottom: '1.5rem',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '1rem'
+        }}>
+          <span style={{ fontSize: '2rem' }}>⚠️</span>
+          <div>
+            <strong style={{ color: 'var(--warning-color)' }}>
+              {!connectionStatus?.is_connected 
+                ? 'Telegram not connected' 
+                : 'No channels selected'}
+            </strong>
+            <p style={{ margin: '0.25rem 0 0', color: 'var(--text-secondary)' }}>
+              {!connectionStatus?.is_connected 
+                ? 'Go to the Configuration tab to connect your Telegram account.' 
+                : 'Go to the Configuration tab to select channels to monitor.'}
+            </p>
+          </div>
+          <button 
+            onClick={() => setActiveTab('config')} 
+            className="btn btn-primary"
+            style={{ marginLeft: 'auto', whiteSpace: 'nowrap' }}
+          >
+            Configure →
+          </button>
+        </div>
+      )}
+    
       {renderStats()}
       
       {/* Filters */}
       <div style={{ 
-        display: 'flex', 
-        gap: '1rem', 
-        marginBottom: '1rem',
-        flexWrap: 'wrap',
-        alignItems: 'center'
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+        gap: '1rem',
+        marginBottom: '1rem'
       }}>
-        <div className="form-group" style={{ margin: 0, minWidth: '200px' }}>
+        <div className="form-group" style={{ margin: 0 }}>
+          <label style={{ fontSize: '0.9rem', fontWeight: '600', marginBottom: '0.5rem', display: 'block' }}>
+            Filter by Chat
+          </label>
           <select
             value={selectedChatFilter}
             onChange={(e) => setSelectedChatFilter(e.target.value)}
-            style={{ width: '100%' }}
+            className="form-control"
           >
             <option value="">All Chats</option>
             {messageStats?.chats?.map(chat => (
@@ -640,45 +848,113 @@ function TelegramConfig() {
           </select>
         </div>
         
-        <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-          <input
-            type="checkbox"
-            checked={filterSignalsOnly}
-            onChange={(e) => setFilterSignalsOnly(e.target.checked)}
-          />
-          Show signals only
-        </label>
+        <div className="form-group" style={{ margin: 0 }}>
+          <label style={{ 
+            fontSize: '0.9rem', 
+            fontWeight: '600', 
+            marginBottom: '0.5rem', 
+            display: 'flex', 
+            alignItems: 'center', 
+            gap: '0.5rem' 
+          }}>
+            <input
+              type="checkbox"
+              checked={filterSignalsOnly}
+              onChange={(e) => setFilterSignalsOnly(e.target.checked)}
+              style={{ width: 'auto' }}
+            />
+            Trading Signals Only
+            {filterSignalsOnly && (
+              <span className="badge" style={{ backgroundColor: 'var(--primary-color)', marginLeft: 'auto' }}>
+                {filteredMessages.filter(msg => msg.is_signal).length} of {filteredMessages.length}
+              </span>
+            )}
+          </label>
+        </div>
         
-        <button 
-          onClick={fetchMessages} 
-          className="btn"
-          style={{ marginLeft: 'auto' }}
-        >
-          🔄 Refresh
-        </button>
+        <div className="form-group" style={{ margin: 0 }}>
+          <label style={{ fontSize: '0.9rem', fontWeight: '600', marginBottom: '0.5rem', display: 'block', opacity: 0 }}>
+            _
+          </label>
+          <button 
+            onClick={() => fetchMessages(true)} 
+            className="btn btn-outline"
+            disabled={loading}
+            style={{ 
+              width: '100%',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: '0.5rem'
+            }}
+          >
+            <span style={{
+              display: 'inline-block',
+              animation: loading ? 'spin 1s linear infinite' : 'none'
+            }}>🔄</span>
+            {loading ? 'Fetching...' : 'Refresh Now'}
+          </button>
+        </div>
       </div>
 
       {/* Messages List */}
       <div className="card">
-        <h3 style={{ marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-          <span style={{
-            width: '10px',
-            height: '10px',
-            borderRadius: '50%',
-            backgroundColor: 'var(--success-color)',
-            animation: 'pulse 2s infinite'
-          }} />
-          Live Messages
-          <small style={{ color: 'var(--text-secondary)', fontWeight: 'normal' }}>
-            (WebSocket connected)
-          </small>
-        </h3>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+          <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            {connectionStatus?.is_connected ? (
+              <>
+                <span style={{
+                  width: '10px',
+                  height: '10px',
+                  borderRadius: '50%',
+                  backgroundColor: 'var(--success-color)',
+                  animation: 'pulse 2s infinite'
+                }} />
+                Live Messages
+                <small style={{ color: 'var(--text-secondary)', fontWeight: 'normal' }}>
+                  (Real-time • Auto-refresh: 10s)
+                </small>
+              </>
+            ) : (
+              <>
+                <span style={{
+                  width: '10px',
+                  height: '10px',
+                  borderRadius: '50%',
+                  backgroundColor: 'var(--danger-color)'
+                }} />
+                Messages
+                <small style={{ color: 'var(--text-secondary)', fontWeight: 'normal' }}>
+                  (Stored messages)
+                </small>
+              </>
+            )}
+          </h3>
+          
+          {/* Message count badge */}
+          <div style={{
+            padding: '0.4rem 0.8rem',
+            borderRadius: '1rem',
+            backgroundColor: 'var(--primary-color)',
+            color: 'white',
+            fontSize: '0.85rem',
+            fontWeight: 'bold'
+          }}>
+            {filteredMessages.length} messages
+          </div>
+        </div>
         
         <div style={{ maxHeight: '600px', overflowY: 'auto' }}>
           {filteredMessages.length === 0 ? (
-            <p style={{ color: 'var(--text-secondary)', textAlign: 'center', padding: '2rem' }}>
-              No messages yet. Messages will appear here in real-time.
-            </p>
+            <div style={{ color: 'var(--text-secondary)', textAlign: 'center', padding: '3rem' }}>
+              <p style={{ fontSize: '3rem', marginBottom: '1rem' }}>📭</p>
+              <p style={{ fontSize: '1.1rem', marginBottom: '0.5rem' }}>No messages yet</p>
+              <p style={{ fontSize: '0.9rem' }}>
+                {connectionStatus?.is_connected 
+                  ? 'Messages will appear here in real-time when received from your monitored channels.'
+                  : 'Connect Telegram and select channels to start receiving messages.'}
+              </p>
+            </div>
           ) : (
             filteredMessages.map(msg => renderMessageCard(msg))
           )}
@@ -767,129 +1043,209 @@ function TelegramConfig() {
     </div>
   )
 
-  const renderConfigTab = () => (
-    <div className="grid grid-2">
-      <div className="card">
-        <h2>🔧 Setup Telegram</h2>
-        <form onSubmit={handleSubmit}>
-          <div className="form-group">
-            <label>API ID</label>
-            <input
-              type="text"
-              value={config.api_id}
-              onChange={(e) => setConfig({ ...config, api_id: e.target.value })}
-              required
-            />
-            <small style={{ color: 'var(--text-secondary)', display: 'block', marginTop: '0.25rem' }}>
-              Get from <a href="https://my.telegram.org" target="_blank" rel="noopener noreferrer">my.telegram.org</a>
-            </small>
-          </div>
-
-          <div className="form-group">
-            <label>API Hash</label>
-            <input
-              type="password"
-              value={config.api_hash}
-              onChange={(e) => setConfig({ ...config, api_hash: e.target.value })}
-              required
-            />
-          </div>
-
-          <div className="form-group">
-            <label>Phone Number</label>
-            <input
-              type="text"
-              value={config.phone_number}
-              onChange={(e) => setConfig({ ...config, phone_number: e.target.value })}
-              placeholder="+911234567890"
-              required
-            />
-          </div>
-
-          <button type="submit" className="btn btn-primary" disabled={loading} style={{ width: '100%' }}>
-            {loading ? '⏳ Saving...' : '💾 Save & Initialize'}
-          </button>
-        </form>
-
-        {needsVerification && (
-          <form onSubmit={handleVerification} style={{ marginTop: '1.5rem', paddingTop: '1.5rem', borderTop: '1px solid var(--border-color)' }}>
-            <div className="form-group">
-              <label>📱 Verification Code</label>
-              <input
-                type="text"
-                value={verificationCode}
-                onChange={(e) => setVerificationCode(e.target.value)}
-                placeholder="12345"
-                required
-                style={{ fontSize: '1.5rem', textAlign: 'center', letterSpacing: '0.5rem' }}
-              />
-              <small style={{ color: 'var(--text-secondary)' }}>
-                Enter the code sent to your Telegram app
-              </small>
+  const renderConfigTab = () => {
+    // Determine current step
+    const step1Complete = config.api_id && config.api_hash && config.phone_number
+    const step2Complete = connectionStatus?.is_connected
+    const step3Complete = connectionStatus?.monitored_chats_count > 0
+    
+    return (
+      <div>
+        {/* Setup Progress */}
+        <div className="card" style={{ marginBottom: '1.5rem', borderLeft: '4px solid var(--primary-color)' }}>
+          <h3 style={{ marginBottom: '1rem' }}>📋 Setup Progress</h3>
+          <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
+            <div style={{
+              padding: '0.5rem 1rem',
+              borderRadius: '0.5rem',
+              backgroundColor: step1Complete ? 'rgba(16, 185, 129, 0.2)' : 'var(--bg-color)',
+              border: `1px solid ${step1Complete ? 'var(--success-color)' : 'var(--border-color)'}`
+            }}>
+              {step1Complete ? '✅' : '1️⃣'} Enter API Credentials
             </div>
-            <button type="submit" className="btn btn-success" disabled={loading} style={{ width: '100%' }}>
-              ✓ Verify
-            </button>
-          </form>
-        )}
-      </div>
-
-      <div className="card">
-        <h2>📡 Monitored Chats</h2>
-        {availableChats.length === 0 ? (
-          <div style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-secondary)' }}>
-            <p>🔒 Configure and authorize Telegram to see available chats</p>
+            <div style={{
+              padding: '0.5rem 1rem',
+              borderRadius: '0.5rem',
+              backgroundColor: step2Complete ? 'rgba(16, 185, 129, 0.2)' : 'var(--bg-color)',
+              border: `1px solid ${step2Complete ? 'var(--success-color)' : 'var(--border-color)'}`
+            }}>
+              {step2Complete ? '✅' : '2️⃣'} Verify Phone Number
+            </div>
+            <div style={{
+              padding: '0.5rem 1rem',
+              borderRadius: '0.5rem',
+              backgroundColor: step3Complete ? 'rgba(16, 185, 129, 0.2)' : 'var(--bg-color)',
+              border: `1px solid ${step3Complete ? 'var(--success-color)' : 'var(--border-color)'}`
+            }}>
+              {step3Complete ? '✅' : '3️⃣'} Select Channels
+            </div>
           </div>
-        ) : (
-          <>
-            <div style={{ maxHeight: '350px', overflowY: 'auto', marginBottom: '1rem' }}>
-              {availableChats.map((chat) => (
-                <div
-                  key={chat.id}
-                  style={{
-                    padding: '0.75rem 1rem',
-                    marginBottom: '0.5rem',
-                    backgroundColor: config.monitored_chats.includes(String(chat.id)) 
-                      ? 'var(--primary-color)' 
-                      : 'var(--bg-color)',
-                    color: config.monitored_chats.includes(String(chat.id)) 
-                      ? 'white' 
-                      : 'var(--text-color)',
-                    borderRadius: '0.5rem',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center'
-                  }}
-                  onClick={() => toggleChat(String(chat.id))}
-                >
-                  <div>
-                    <strong>{chat.name}</strong>
-                    {chat.username && (
-                      <small style={{ marginLeft: '0.5rem', opacity: 0.8 }}>
-                        @{chat.username}
-                      </small>
-                    )}
-                  </div>
-                  {config.monitored_chats.includes(String(chat.id)) && (
-                    <span>✓</span>
-                  )}
+        </div>
+
+        <div className="grid grid-2">
+          <div className="card">
+            <h2>🔧 Step 1 & 2: Telegram Credentials</h2>
+            <p style={{ color: 'var(--text-secondary)', marginBottom: '1rem', fontSize: '0.9rem' }}>
+              Get your API credentials from <a href="https://my.telegram.org" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary-color)' }}>my.telegram.org</a>
+            </p>
+            <form onSubmit={handleSubmit}>
+              <div className="form-group">
+                <label>API ID</label>
+                <input
+                  type="text"
+                  value={config.api_id}
+                  onChange={(e) => setConfig({ ...config, api_id: e.target.value })}
+                  placeholder="12345678"
+                  required
+                />
+              </div>
+
+              <div className="form-group">
+                <label>API Hash</label>
+                <input
+                  type="password"
+                  value={config.api_hash}
+                  onChange={(e) => setConfig({ ...config, api_hash: e.target.value })}
+                  placeholder="a1b2c3d4e5f6..."
+                  required
+                />
+              </div>
+
+              <div className="form-group">
+                <label>Phone Number (International Format)</label>
+                <input
+                  type="text"
+                  value={config.phone_number}
+                  onChange={(e) => setConfig({ ...config, phone_number: e.target.value })}
+                  placeholder="+911234567890"
+                  required
+                />
+                <small style={{ color: 'var(--text-secondary)', display: 'block', marginTop: '0.25rem' }}>
+                  Include country code (e.g., +91 for India)
+                </small>
+              </div>
+
+              <button 
+                type="submit" 
+                className="btn btn-primary" 
+                disabled={loading} 
+                style={{ width: '100%' }}
+              >
+                {loading ? '⏳ Processing...' : connectionStatus?.is_connected ? '✅ Connected' : '🔗 Connect & Verify'}
+              </button>
+            </form>
+
+            {needsVerification && (
+              <form onSubmit={handleVerification} style={{ marginTop: '1.5rem', paddingTop: '1.5rem', borderTop: '1px solid var(--border-color)' }}>
+                <div style={{ 
+                  backgroundColor: 'rgba(37, 99, 235, 0.1)', 
+                  padding: '1rem', 
+                  borderRadius: '0.5rem',
+                  marginBottom: '1rem'
+                }}>
+                  <strong>📱 Check your Telegram app!</strong>
+                  <p style={{ margin: '0.5rem 0 0', fontSize: '0.9rem', color: 'var(--text-secondary)' }}>
+                    A verification code has been sent to your Telegram account.
+                  </p>
                 </div>
-              ))}
-            </div>
-            <button 
-              onClick={updateMonitoredChats} 
-              className="btn btn-primary" 
-              disabled={loading}
-              style={{ width: '100%' }}
-            >
-              💾 Update Monitored Chats
-            </button>
-          </>
-        )}
+                <div className="form-group">
+                  <label>Verification Code</label>
+                  <input
+                    type="text"
+                    value={verificationCode}
+                    onChange={(e) => setVerificationCode(e.target.value)}
+                    placeholder="12345"
+                    required
+                    style={{ fontSize: '1.5rem', textAlign: 'center', letterSpacing: '0.5rem' }}
+                    maxLength={6}
+                  />
+                </div>
+                <button type="submit" className="btn btn-success" disabled={loading} style={{ width: '100%' }}>
+                  {loading ? '⏳ Verifying...' : '✓ Verify Code'}
+                </button>
+              </form>
+            )}
+          </div>
+
+          <div className="card">
+            <h2>📡 Step 3: Select Channels to Monitor</h2>
+            {!connectionStatus?.is_connected ? (
+              <div style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-secondary)' }}>
+                <p style={{ fontSize: '3rem', marginBottom: '1rem' }}>🔒</p>
+                <p>Complete Step 1 & 2 to see your Telegram channels</p>
+              </div>
+            ) : availableChats.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-secondary)' }}>
+                <p style={{ fontSize: '3rem', marginBottom: '1rem' }}>📭</p>
+                <p>No groups or channels found.</p>
+                <p style={{ fontSize: '0.9rem', marginTop: '0.5rem' }}>
+                  Make sure you've joined some Telegram groups or channels.
+                </p>
+                <button onClick={fetchChats} className="btn" style={{ marginTop: '1rem' }}>
+                  🔄 Refresh Channels
+                </button>
+              </div>
+            ) : (
+              <>
+                <p style={{ color: 'var(--text-secondary)', marginBottom: '1rem', fontSize: '0.9rem' }}>
+                  Select the channels you want to monitor for trading signals. Click to toggle.
+                </p>
+                <div style={{ maxHeight: '300px', overflowY: 'auto', marginBottom: '1rem' }}>
+                  {availableChats.map((chat) => (
+                    <div
+                      key={chat.id}
+                      style={{
+                        padding: '0.75rem 1rem',
+                        marginBottom: '0.5rem',
+                        backgroundColor: config.monitored_chats.includes(String(chat.id)) 
+                          ? 'var(--primary-color)' 
+                          : 'var(--bg-color)',
+                        color: config.monitored_chats.includes(String(chat.id)) 
+                          ? 'white' 
+                          : 'var(--text-color)',
+                        borderRadius: '0.5rem',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        transition: 'all 0.2s'
+                      }}
+                      onClick={() => toggleChat(String(chat.id))}
+                    >
+                      <div>
+                        <strong>{chat.name}</strong>
+                        {chat.username && (
+                          <small style={{ marginLeft: '0.5rem', opacity: 0.8 }}>
+                            @{chat.username}
+                          </small>
+                        )}
+                      </div>
+                      {config.monitored_chats.includes(String(chat.id)) && (
+                        <span>✓</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                  <button 
+                    onClick={updateMonitoredChats} 
+                    className="btn btn-primary" 
+                    disabled={loading}
+                    style={{ flex: 1 }}
+                  >
+                    💾 Save & Start Monitoring ({config.monitored_chats.length} selected)
+                  </button>
+                  <button onClick={fetchChats} className="btn" disabled={loading} title="Refresh channel list">
+                    🔄
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
       </div>
-    </div>
-  )
+    )
+  }
 
   const renderTradeModal = () => {
     if (!showTradeModal || !selectedMessage) return null
@@ -1405,29 +1761,52 @@ function TelegramConfig() {
 
   return (
     <div>
-      <div style={{ 
-        display: 'flex', 
-        justifyContent: 'space-between', 
-        alignItems: 'center',
-        marginBottom: '1.5rem'
-      }}>
-        <h1>📱 Telegram</h1>
-        {renderConnectionBadge()}
-      </div>
+      {initialLoading ? (
+        <div className="card" style={{ textAlign: 'center', padding: '3rem' }}>
+          <div style={{
+            width: '40px',
+            height: '40px',
+            border: '3px solid var(--border-color)',
+            borderTopColor: 'var(--primary-color)',
+            borderRadius: '50%',
+            animation: 'spin 1s linear infinite',
+            margin: '0 auto'
+          }} />
+          <p style={{ marginTop: '1rem', color: 'var(--text-secondary)' }}>Loading Telegram configuration...</p>
+        </div>
+      ) : (
+        <>
+          <div style={{ 
+            display: 'flex', 
+            justifyContent: 'space-between', 
+            alignItems: 'center',
+            marginBottom: '1.5rem',
+            flexWrap: 'wrap',
+            gap: '1rem'
+          }}>
+            <h1>📱 Telegram</h1>
+            {renderConnectionBadge()}
+          </div>
 
-      {renderTabs()}
+          {renderTabs()}
 
-      {activeTab === 'messages' && renderMessagesTab()}
-      {activeTab === 'history' && renderHistoryTab()}
-      {activeTab === 'config' && renderConfigTab()}
+          {activeTab === 'messages' && renderMessagesTab()}
+          {activeTab === 'history' && renderHistoryTab()}
+          {activeTab === 'config' && renderConfigTab()}
 
-      {/* Trade Execution Modal */}
-      {renderTradeModal()}
+          {/* Trade Execution Modal */}
+          {renderTradeModal()}
+        </>
+      )}
 
       <style>{`
         @keyframes pulse {
           0%, 100% { opacity: 1; }
           50% { opacity: 0.5; }
+        }
+        
+        @keyframes spin {
+          to { transform: rotate(360deg); }
         }
         
         .grid-4 {

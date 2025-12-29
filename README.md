@@ -268,6 +268,42 @@ Remove-Item backend/trading_bot.db
 - [ ] Paper trading mode
 - [ ] Strategy builder
 
+## 🚂 Railway Deployment
+
+You can deploy both backend and frontend to Railway as separate services:
+
+### 1. Backend (FastAPI)
+- Service root: `backend/`
+- Build command: `pip install -r requirements.txt`
+- Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+- Set environment variables in Railway dashboard (copy from `.env.example`)
+- SQLite is supported for small projects, but for production use Railway Postgres and update `DATABASE_URL` accordingly.
+
+### 2. Frontend (React + Vite)
+- Service root: `frontend/`
+- Build command: `npm install && npm run build`
+- Start command: `npm run preview -- --host --port $PORT`
+- Set any frontend environment variables as needed (e.g., API base URL)
+
+### 3. Multi-Service Setup
+- Use the provided `railway.json` for multi-service deployment.
+- Each service can be deployed and scaled independently.
+
+### 4. General Steps
+1. Push your code to GitHub.
+2. Create a new Railway project and link your repo.
+3. Add two services: one for `backend/`, one for `frontend/`.
+4. Set environment variables for each service.
+5. Deploy!
+
+### 🚀 Using Railway Postgres (Production)
+- In Railway, add a Postgres plugin to your project.
+- Set the `DATABASE_URL` environment variable in the backend service to the value provided by Railway (format: `postgresql+psycopg2://postgres:<password>@<host>:<port>/<db>`).
+- The backend will automatically use Postgres if `DATABASE_URL` is set to a Postgres URI.
+- No code changes needed—SQLAlchemy handles both SQLite and Postgres.
+
+See [Railway Docs](https://docs.railway.app/) for more details.
+
 ## 📝 License
 
 This project is for educational purposes. Use at your own risk. Trading involves financial risk.

@@ -64,13 +64,15 @@ class ZerodhaBrokerService(BrokerInterface):
         4. Get request_token from redirect URL
         5. Generate access_token using request_token
         
-        For this method, 'password' should be the request_token from redirect.
+        For this method, 'password' can be either:
+        - request_token from OAuth redirect (for new login)
+        - access_token (for session restoration)
         
         Args:
             api_key: Zerodha API key
             client_id: Zerodha client ID (user ID)
-            password: Request token from OAuth redirect
-            totp_secret: Not used for Zerodha
+            password: Request token from OAuth redirect OR access_token for restoration
+            totp_secret: API secret (for OAuth) or None (for token restoration)
             
         Returns:
             Dict with login status
@@ -88,30 +90,52 @@ class ZerodhaBrokerService(BrokerInterface):
             # Initialize KiteConnect
             self._kite = KiteConnect(api_key=api_key)
             
-            # If password is provided, treat it as request_token
+            # If password is provided
             if password:
-                # Generate session with request_token
-                api_secret = totp_secret  # Reuse totp_secret field for api_secret
-                if not api_secret:
+                # Check if this is an access token (starts with certain pattern) or request token
+                # Access tokens are typically longer and start with specific pattern
+                # For simplicity, if totp_secret (api_secret) is provided, it's OAuth flow
+                # If not provided, assume password is an access_token for restoration
+                
+                if totp_secret:
+                    # OAuth flow: password is request_token, totp_secret is api_secret
+                    api_secret = totp_secret
+                    data = self._kite.generate_session(
+                        request_token=password,
+                        api_secret=api_secret
+                    )
+                    
+                    self._access_token = data["access_token"]
+                    self._kite.set_access_token(self._access_token)
+                    self._is_logged_in = True
+                    
                     return {
-                        "status": "error",
-                        "message": "API secret is required for Zerodha login"
+                        "status": "success",
+                        "message": "Successfully logged in to Zerodha",
+                        "access_token": self._access_token
                     }
-                
-                data = self._kite.generate_session(
-                    request_token=password,
-                    api_secret=api_secret
-                )
-                
-                self._access_token = data["access_token"]
-                self._kite.set_access_token(self._access_token)
-                self._is_logged_in = True
-                
-                return {
-                    "status": "success",
-                    "message": "Successfully logged in to Zerodha",
-                    "access_token": self._access_token
-                }
+                else:
+                    # Session restoration: password is access_token
+                    self._access_token = password
+                    self._kite.set_access_token(self._access_token)
+                    
+                    # Verify token by making a simple API call
+                    try:
+                        profile = self._kite.profile()
+                        self._is_logged_in = True
+                        logger.info(f"✅ Zerodha session restored for {profile.get('user_id', client_id)}")
+                        return {
+                            "status": "success",
+                            "message": "Session restored successfully",
+                            "access_token": self._access_token
+                        }
+                    except Exception as e:
+                        logger.warning(f"⚠️ Access token validation failed: {str(e)}")
+                        self._is_logged_in = False
+                        return {
+                            "status": "error",
+                            "message": f"Saved session invalid: {str(e)}"
+                        }
             else:
                 # Return login URL for manual login
                 login_url = self._kite.login_url()
