@@ -1,0 +1,125 @@
+# ============================================
+# Telegram Trading Bot - Docker Compose
+# Production Configuration
+# ============================================
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up --build -d
+# ============================================
+
+services:
+  # ---- Backend Service (Production) ----
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    container_name: telegram-trading-backend-prod
+    ports:
+      - "8000:8000"
+    environment:
+      # Database - Use PostgreSQL in production
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/trading_bot.db}
+      
+      # Security
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      
+      # Telegram API
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_PHONE_NUMBER=${TELEGRAM_PHONE_NUMBER}
+      
+      # Angel One Broker
+      - ANGEL_ONE_API_KEY=${ANGEL_ONE_API_KEY:-}
+      - ANGEL_ONE_CLIENT_ID=${ANGEL_ONE_CLIENT_ID:-}
+      - ANGEL_ONE_PASSWORD=${ANGEL_ONE_PASSWORD:-}
+      - ANGEL_ONE_TOTP_SECRET=${ANGEL_ONE_TOTP_SECRET:-}
+      
+      # Zerodha Broker (optional)
+      - ZERODHA_API_KEY=${ZERODHA_API_KEY:-}
+      - ZERODHA_API_SECRET=${ZERODHA_API_SECRET:-}
+      - ZERODHA_ACCESS_TOKEN=${ZERODHA_ACCESS_TOKEN:-}
+      
+      # Application Settings
+      - AUTO_TRADE_ENABLED=${AUTO_TRADE_ENABLED:-false}
+      - REQUIRE_MANUAL_APPROVAL=${REQUIRE_MANUAL_APPROVAL:-true}
+      - DEFAULT_QUANTITY=${DEFAULT_QUANTITY:-1}
+      - MAX_TRADES_PER_DAY=${MAX_TRADES_PER_DAY:-10}
+      - RISK_PERCENTAGE=${RISK_PERCENTAGE:-1.0}
+      
+      # AI Signal Parsing (Gemini)
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      
+      # Production settings
+      - PYTHONUNBUFFERED=1
+      - ENVIRONMENT=production
+    volumes:
+      # Only persist data volumes (no source mounting in production)
+      - backend_data:/app/data
+      - backend_sessions:/app/sessions
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---- Frontend Service (Production with Nginx) ----
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: production
+      args:
+        - VITE_API_URL=${VITE_API_URL:-http://localhost:8000}
+    container_name: telegram-trading-frontend-prod
+    ports:
+      - "80:80"
+    restart: always
+    depends_on:
+      backend:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 128M
+        reservations:
+          cpus: '0.1'
+          memory: 32M
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ---- Volumes ----
+volumes:
+  backend_data:
+    driver: local
+  backend_sessions:
+    driver: local
+
+# ---- Networks ----
+networks:
+  default:
+    name: telegram-trading-network-prod

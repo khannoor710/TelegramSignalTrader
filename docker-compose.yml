@@ -1,37 +1,93 @@
-version: '3.8'
+# ============================================
+# Telegram Trading Bot - Docker Compose
+# Development Configuration
+# ============================================
+# Usage: docker-compose up --build
+# ============================================
 
 services:
+  # ---- Backend Service ----
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      target: development
     container_name: telegram-trading-backend
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=sqlite:///./data/trading_bot.db
+      # Database
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/trading_bot.db}
+      
+      # Security
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      
+      # Telegram API
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_PHONE_NUMBER=${TELEGRAM_PHONE_NUMBER}
+      
+      # Angel One Broker (optional)
+      - ANGEL_ONE_API_KEY=${ANGEL_ONE_API_KEY:-}
+      - ANGEL_ONE_CLIENT_ID=${ANGEL_ONE_CLIENT_ID:-}
+      - ANGEL_ONE_PASSWORD=${ANGEL_ONE_PASSWORD:-}
+      - ANGEL_ONE_TOTP_SECRET=${ANGEL_ONE_TOTP_SECRET:-}
+      
+      # Application Settings
+      - AUTO_TRADE_ENABLED=${AUTO_TRADE_ENABLED:-false}
+      - REQUIRE_MANUAL_APPROVAL=${REQUIRE_MANUAL_APPROVAL:-true}
+      - DEFAULT_QUANTITY=${DEFAULT_QUANTITY:-1}
+      - MAX_TRADES_PER_DAY=${MAX_TRADES_PER_DAY:-10}
+      - RISK_PERCENTAGE=${RISK_PERCENTAGE:-1.0}
+      
+      # AI Signal Parsing (Gemini)
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      
+      # Development settings
+      - PYTHONUNBUFFERED=1
     volumes:
+      # Mount source code for hot reload
       - ./backend:/app
+      # Persist database
       - ./data:/app/data
+      # Persist Telegram sessions
+      - ./sessions:/app/sessions
     restart: unless-stopped
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 
+  # ---- Frontend Service ----
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      target: development
     container_name: telegram-trading-frontend
     ports:
       - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
     volumes:
+      # Mount source code for hot reload
       - ./frontend:/app
+      # Anonymous volume for node_modules (don't override with host)
       - /app/node_modules
     restart: unless-stopped
     depends_on:
-      - backend
-    command: npm run dev -- --host
+      backend:
+        condition: service_healthy
 
+# ---- Volumes ----
+volumes:
+  data:
+  sessions:
+
+# ---- Networks ----
 networks:
   default:
     name: telegram-trading-network
