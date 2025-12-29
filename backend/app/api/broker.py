@@ -282,7 +282,7 @@ async def get_positions(db: Session = Depends(get_db)):
 
 @router.get("/holdings")
 async def get_holdings(db: Session = Depends(get_db)):
-    """Get long-term holdings (delivery stocks) from active broker"""
+    """Get long-term holdings (delivery stocks) from active broker with current prices"""
     # Get active broker
     settings = db.query(AppSettings).first()
     if not settings or not settings.active_broker_type:
@@ -300,6 +300,72 @@ async def get_holdings(db: Session = Depends(get_db)):
     result = broker.get_holdings()
     if result.get('status') == 'error':
         raise HTTPException(status_code=400, detail=result.get('message', 'Failed to fetch holdings'))
+    
+    # Enrich holdings with current prices if data is available
+    holdings = result.get('data', [])
+    if holdings and isinstance(holdings, list):
+        enriched_holdings = []
+        for holding in holdings:
+            try:
+                # Get symbol and exchange from holding
+                symbol = holding.get('tradingsymbol') or holding.get('symbol')
+                exchange = holding.get('exchange', 'NSE')
+                
+                # First check if holding already has price data (Zerodha includes it)
+                current_price = (
+                    holding.get('last_price') or 
+                    holding.get('ltp') or 
+                    holding.get('lastprice') or
+                    holding.get('close_price')
+                )
+                
+                # Only fetch LTP via API if price not already in holding data
+                if not current_price and symbol:
+                    try:
+                        ltp_result = broker.get_ltp(symbol, exchange)
+                        if ltp_result is not None:
+                            if isinstance(ltp_result, (int, float)):
+                                current_price = float(ltp_result)
+                            elif isinstance(ltp_result, dict):
+                                if ltp_result.get('status') == 'success':
+                                    ltp_data = ltp_result.get('data', {})
+                                    if isinstance(ltp_data, dict):
+                                        current_price = ltp_data.get('ltp') or ltp_data.get('last_price')
+                                    elif isinstance(ltp_data, (int, float)):
+                                        current_price = float(ltp_data)
+                                else:
+                                    current_price = ltp_result.get('ltp') or ltp_result.get('last_price')
+                    except Exception:
+                        pass  # Silently ignore LTP fetch failures
+                
+                if current_price:
+                    current_price = float(current_price)
+                    holding['last_price'] = current_price
+                    holding['current_price'] = current_price
+                    holding['ltp'] = current_price
+                    
+                    # Calculate P&L if we have average price
+                    avg_price = holding.get('average_price') or holding.get('averageprice') or holding.get('avg_price', 0)
+                    quantity = holding.get('quantity') or holding.get('t1_quantity', 0) or 0
+                    
+                    if avg_price and quantity:
+                        avg_price = float(avg_price)
+                        quantity = int(quantity)
+                        pnl = (current_price - avg_price) * quantity
+                        pnl_percent = ((current_price - avg_price) / avg_price * 100) if avg_price > 0 else 0
+                        
+                        holding['pnl'] = round(pnl, 2)
+                        holding['pnl_percentage'] = round(pnl_percent, 2)
+                        holding['current_value'] = round(current_price * quantity, 2)
+                        holding['invested_value'] = round(avg_price * quantity, 2)
+                
+                enriched_holdings.append(holding)
+            except Exception as e:
+                # If processing fails, just add the holding as-is
+                enriched_holdings.append(holding)
+        
+        result['data'] = enriched_holdings
+    
     return result
 
 

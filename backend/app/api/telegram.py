@@ -403,8 +403,14 @@ async def execute_trade_from_message(
     message.is_processed = True
     db.commit()
     
-    # Check broker status
-    if not broker_service.is_logged_in:
+    # Get active broker from registry instead of hardcoded broker_service
+    from app.services.broker_registry import broker_registry
+    active_broker = broker_registry.get_active_broker(db)
+    
+    # Check broker status - use active broker
+    broker_logged_in = active_broker.is_logged_in if active_broker else broker_service.is_logged_in
+    
+    if not broker_logged_in:
         logger.warning(f"⚠️  Broker not logged in. Trade {db_trade.id} created but not executed.")
         logger.info(f"{'='*60}\n")
         return {
@@ -427,7 +433,10 @@ async def execute_trade_from_message(
         logger.info("  Auto-trade: Enabled")
         logger.info("  Manual approval: Not required")
         
-        result = broker_service.place_order(
+        # Use active broker for execution
+        trading_broker = active_broker if active_broker else broker_service
+        
+        result = trading_broker.place_order(
             symbol=db_trade.symbol,
             action=db_trade.action,
             quantity=db_trade.quantity,
@@ -714,11 +723,23 @@ async def get_message_signal(message_id: int, db: Session = Depends(get_db)):
             if token:
                 token_info = {"token": token, "exchange": "BSE"}
     
-    # Get broker status
-    broker_status = {
-        "is_logged_in": broker_service.is_logged_in,
-        "client_id": broker_service.client_id if broker_service.is_logged_in else None
-    }
+    # Get broker status - use active broker from registry instead of just Angel One
+    from app.services.broker_registry import broker_registry
+    active_broker = broker_registry.get_active_broker(db)
+    
+    if active_broker:
+        broker_status = {
+            "is_logged_in": active_broker.is_logged_in,
+            "client_id": active_broker.client_id if active_broker.is_logged_in else None,
+            "broker_type": db.query(AppSettings).first().active_broker_type if db.query(AppSettings).first() else None
+        }
+    else:
+        # Fallback to legacy broker_service for backward compatibility
+        broker_status = {
+            "is_logged_in": broker_service.is_logged_in,
+            "client_id": broker_service.client_id if broker_service.is_logged_in else None,
+            "broker_type": "angel_one"
+        }
     
     # Get settings
     settings = db.query(AppSettings).first()

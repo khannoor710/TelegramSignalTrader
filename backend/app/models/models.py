@@ -104,6 +104,7 @@ class AppSettings(Base):
     paper_trading_enabled = Column(Boolean, default=True)  # Paper trading mode
     paper_trading_balance = Column(Float, default=100000.0)  # Virtual starting balance
     active_broker_type = Column(String, default="angel_one")  # Currently active broker
+    price_tolerance_percent = Column(Float, default=2.0)  # Max % deviation from signal price for auto-trade
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

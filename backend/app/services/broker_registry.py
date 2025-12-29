@@ -142,6 +142,7 @@ class BrokerRegistry:
             try:
                 from app.services.zerodha_broker_service import zerodha_broker_service
                 if zerodha_broker_service is not None:
+                    print(f"🔍 [BrokerRegistry] Returning Zerodha singleton (id={id(zerodha_broker_service)}, logged_in={zerodha_broker_service.is_logged_in})")
                     if cache:
                         self._instances[broker_type] = zerodha_broker_service
                     return zerodha_broker_service

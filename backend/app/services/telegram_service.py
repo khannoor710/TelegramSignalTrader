@@ -330,6 +330,53 @@ class TelegramService:
                         "message": f"New {parsed_signal.get('action')} signal for {parsed_signal.get('symbol')} from {chat_name}"
                     }
                 })
+                
+                # Attempt automatic trade execution
+                try:
+                    from app.services.auto_trade_service import get_auto_trade_service
+                    
+                    auto_trade_service = get_auto_trade_service()
+                    
+                    # Broadcast that auto-trade is being attempted
+                    await self.ws_manager.broadcast({
+                        "type": "auto_trade_started",
+                        "data": {
+                            "message_id": message.id,
+                            "symbol": parsed_signal.get('symbol'),
+                            "action": parsed_signal.get('action'),
+                            "chat_name": chat_name
+                        }
+                    })
+                    
+                    # Process the signal for auto-trading
+                    auto_result = await auto_trade_service.process_signal(
+                        parsed_signal=parsed_signal,
+                        message_id=message.id,
+                        chat_name=chat_name,
+                        db=db
+                    )
+                    
+                    # Broadcast auto-trade result
+                    await self.ws_manager.broadcast({
+                        "type": "auto_trade_result",
+                        "data": auto_result
+                    })
+                    
+                    if auto_result.get("status") == "executed":
+                        logger.info(f"🎯 Auto-trade executed for {parsed_signal.get('symbol')}: Order ID {auto_result.get('order_id')}")
+                    elif auto_result.get("auto_trade_attempted"):
+                        logger.info(f"ℹ️ Auto-trade result for {parsed_signal.get('symbol')}: {auto_result.get('status')} - {auto_result.get('reason')}")
+                    
+                except Exception as auto_trade_error:
+                    logger.error(f"Error in auto-trade processing: {auto_trade_error}", exc_info=True)
+                    # Broadcast error but don't fail the message handling
+                    await self.ws_manager.broadcast({
+                        "type": "auto_trade_error",
+                        "data": {
+                            "message_id": message.id,
+                            "error": str(auto_trade_error)
+                        }
+                    })
             
             logger.info(f"📨 New message from {chat_name}: {message_text[:50]}..." if len(message_text) > 50 else f"📨 New message from {chat_name}: {message_text}")
             

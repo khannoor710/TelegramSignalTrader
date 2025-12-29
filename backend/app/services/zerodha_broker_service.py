@@ -370,12 +370,13 @@ class ZerodhaBrokerService(BrokerInterface):
             logger.error(f"Get funds failed: {str(e)}")
             return {"status": "error", "data": None, "message": str(e)}
     
-    def search_symbols(self, query: str) -> List[Dict[str, Any]]:
+    def search_symbols(self, query: str, exchange: str = None) -> List[Dict[str, Any]]:
         """
         Search for trading symbols.
         
         Args:
             query: Search query
+            exchange: Optional exchange filter (NSE, BSE, NFO, etc.)
             
         Returns:
             List of matching symbols
@@ -384,8 +385,11 @@ class ZerodhaBrokerService(BrokerInterface):
             return []
         
         try:
-            # Get instruments
-            instruments = self._kite.instruments()
+            # Get instruments (optionally filter by exchange)
+            if exchange:
+                instruments = self._kite.instruments(exchange)
+            else:
+                instruments = self._kite.instruments()
             
             # Filter by query
             query_upper = query.upper()

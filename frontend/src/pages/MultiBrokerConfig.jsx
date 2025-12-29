@@ -199,10 +199,10 @@ function MultiBrokerConfig({ brokerStatus: propBrokerStatus, onBrokerStatusChang
         if (urlResult.data.login_url) {
           // Open login page
           window.open(urlResult.data.login_url, '_blank')
-          
+
           // Show better instructions
           showMessage('success', '✅ Login page opened! Follow the instructions in the popup.')
-          
+
           // Better prompt with clear instructions
           setTimeout(() => {
             const requestToken = prompt(
@@ -215,11 +215,11 @@ function MultiBrokerConfig({ brokerStatus: propBrokerStatus, onBrokerStatusChang
               '5. Paste it below and click OK\n\n' +
               'Request Token:'
             )
-            
+
             if (requestToken) {
               // Clean the token (remove any extra params)
               const cleanToken = requestToken.trim().split('&')[0]
-              
+
               api.post(`/broker/zerodha/complete-login?request_token=${cleanToken}`)
                 .then(loginResult => {
                   showMessage('success', '✅ Successfully connected to Zerodha!')
@@ -279,8 +279,14 @@ function MultiBrokerConfig({ brokerStatus: propBrokerStatus, onBrokerStatusChang
       await api.post(`/broker/brokers/active?broker_type=${brokerType}`)
       setActiveBroker(brokerType)
       showMessage('success', `Active broker set to ${BROKER_CONFIGS[brokerType]?.name || brokerType}`)
+      // Refresh broker status to notify parent component
+      await refreshBrokerStatus()
+      // Also refresh trading data since active broker changed
+      await fetchTradingData()
+      // Refresh configured brokers list to update UI
+      await fetchConfiguredBrokers()
     } catch (e) {
-      showMessage('error', e.message)
+      showMessage('error', e.response?.data?.detail || e.message)
     }
   }
 
@@ -307,8 +313,17 @@ function MultiBrokerConfig({ brokerStatus: propBrokerStatus, onBrokerStatusChang
     if (!funds) return null
 
     // Parse funds data (varies by broker)
-    const availableMargin = parseFloat(funds.availablecash || funds.available?.cash || funds.net || 0)
-    const usedMargin = parseFloat(funds.utiliseddebits || funds.utilised?.debits || 0)
+    // Zerodha returns: { available_cash, used_margin, available_margin }
+    // Angel One returns: { availablecash, utiliseddebits, collateral, net }
+    const availableMargin = parseFloat(
+      funds.available_margin || funds.available_cash ||
+      funds.availablecash || funds.available?.cash ||
+      funds.net || 0
+    )
+    const usedMargin = parseFloat(
+      funds.used_margin || funds.utiliseddebits ||
+      funds.utilised?.debits || 0
+    )
     const collateral = parseFloat(funds.collateral || 0)
 
     return (
@@ -347,42 +362,95 @@ function MultiBrokerConfig({ brokerStatus: propBrokerStatus, onBrokerStatusChang
       )
     }
 
+    // Calculate positions statistics (handles both Zerodha and Angel One field names)
+    const totalUnrealizedPnL = positions.reduce((sum, p) => {
+      return sum + (parseFloat(p.pnl || p.unrealised || p.unrealized || p.unrealisedpnl || 0))
+    }, 0)
+    const totalRealizedPnL = positions.reduce((sum, p) => {
+      return sum + (parseFloat(p.realised || p.realized || p.realisedpnl || 0))
+    }, 0)
+    const totalPnL = totalUnrealizedPnL + totalRealizedPnL
+    const buyPositions = positions.filter(p => parseInt(p.netqty || p.quantity || p.buyqty || 0) > 0).length
+    const sellPositions = positions.filter(p => parseInt(p.netqty || p.quantity || p.sellqty || 0) < 0).length
+
     return (
-      <div className="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Symbol</th>
-              <th>Type</th>
-              <th>Qty</th>
-              <th>Avg Price</th>
-              <th>LTP</th>
-              <th>P&L</th>
-            </tr>
-          </thead>
-          <tbody>
-            {positions.map((pos, idx) => (
-              <tr key={idx}>
-                <td><strong>{pos.tradingsymbol || pos.symbol}</strong></td>
-                <td>
-                  <span style={{
-                    backgroundColor: pos.producttype === 'DELIVERY' ? 'var(--primary-color)' : 'var(--secondary-color)',
-                    color: 'white',
-                    padding: '0.2rem 0.5rem',
-                    borderRadius: '0.25rem',
-                    fontSize: '0.75rem'
-                  }}>
-                    {pos.producttype || 'INTRADAY'}
-                  </span>
-                </td>
-                <td>{pos.netqty || pos.quantity}</td>
-                <td>{formatCurrency(pos.averageprice || pos.avgprice)}</td>
-                <td>{formatCurrency(pos.ltp || pos.lastprice)}</td>
-                <td>{formatPnL(pos.pnl || pos.unrealised)}</td>
+      <div>
+        {/* Positions Summary */}
+        <div className="grid grid-4" style={{ marginBottom: '1rem' }}>
+          <div className="stat-card">
+            <div className="stat-value">{positions.length}</div>
+            <div className="stat-label">Open Positions ({buyPositions} Long, {sellPositions} Short)</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-value" style={{ color: totalUnrealizedPnL >= 0 ? 'var(--success-color)' : 'var(--danger-color)' }}>
+              {totalUnrealizedPnL >= 0 ? '+' : ''}{formatCurrency(totalUnrealizedPnL)}
+            </div>
+            <div className="stat-label">Unrealized P&L</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-value" style={{ color: totalRealizedPnL >= 0 ? 'var(--success-color)' : 'var(--danger-color)' }}>
+              {totalRealizedPnL >= 0 ? '+' : ''}{formatCurrency(totalRealizedPnL)}
+            </div>
+            <div className="stat-label">Realized P&L</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-value" style={{ color: totalPnL >= 0 ? 'var(--success-color)' : 'var(--danger-color)' }}>
+              {totalPnL >= 0 ? '+' : ''}{formatCurrency(totalPnL)}
+            </div>
+            <div className="stat-label">Total P&L</div>
+          </div>
+        </div>
+
+        <div className="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Type</th>
+                <th>Qty</th>
+                <th>Buy Avg</th>
+                <th>Sell Avg</th>
+                <th>LTP</th>
+                <th>P&L</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {positions.map((pos, idx) => {
+                // Handle multiple broker field name formats
+                const qty = parseInt(pos.netqty || pos.quantity || pos.net_quantity || 0)
+                const buyAvg = parseFloat(pos.averageprice || pos.avgprice || pos.average_price || pos.buyavgprice || 0)
+                const sellAvg = parseFloat(pos.sellavgprice || pos.sell_average_price || 0)
+                const ltp = parseFloat(pos.ltp || pos.lastprice || pos.last_price || 0)
+                const pnl = parseFloat(pos.pnl || pos.unrealised || pos.unrealized || 0)
+                const productType = pos.producttype || pos.product_type || pos.product || 'INTRADAY'
+
+                return (
+                  <tr key={idx}>
+                    <td><strong>{pos.tradingsymbol || pos.symbol}</strong></td>
+                    <td>
+                      <span style={{
+                        backgroundColor: productType === 'DELIVERY' || productType === 'CNC' ? 'var(--primary-color)' : 'var(--secondary-color)',
+                        color: 'white',
+                        padding: '0.2rem 0.5rem',
+                        borderRadius: '0.25rem',
+                        fontSize: '0.75rem'
+                      }}>
+                        {productType}
+                      </span>
+                    </td>
+                    <td style={{ color: qty > 0 ? 'var(--success-color)' : qty < 0 ? 'var(--danger-color)' : 'inherit' }}>
+                      {qty > 0 ? '+' : ''}{qty}
+                    </td>
+                    <td>{formatCurrency(buyAvg)}</td>
+                    <td>{sellAvg > 0 ? formatCurrency(sellAvg) : '-'}</td>
+                    <td>{formatCurrency(ltp)}</td>
+                    <td>{formatPnL(pnl)}</td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
     )
   }
@@ -399,46 +467,101 @@ function MultiBrokerConfig({ brokerStatus: propBrokerStatus, onBrokerStatusChang
       )
     }
 
-    return (
-      <div className="table-container">
-        <table>
-          <thead>
-            <tr>
-              <th>Symbol</th>
-              <th>Qty</th>
-              <th>Avg Price</th>
-              <th>LTP</th>
-              <th>Current Value</th>
-              <th>P&L</th>
-              <th>P&L %</th>
-            </tr>
-          </thead>
-          <tbody>
-            {holdings.map((hold, idx) => {
-              const qty = parseFloat(hold.quantity || hold.realisedquantity || 0)
-              const avgPrice = parseFloat(hold.averageprice || hold.avgprice || 0)
-              const ltp = parseFloat(hold.ltp || hold.lastprice || 0)
-              const currentValue = qty * ltp
-              const investedValue = qty * avgPrice
-              const pnl = currentValue - investedValue
-              const pnlPercent = investedValue > 0 ? ((pnl / investedValue) * 100) : 0
+    // Calculate total P&L and day's P&L
+    const totalPnL = holdings.reduce((sum, h) => sum + (parseFloat(h.pnl) || 0), 0)
+    const daysPnL = holdings.reduce((sum, h) => {
+      const dayChange = parseFloat(h.day_change) || 0
+      const qty = parseFloat(h.quantity || h.realised_quantity || 0)
+      return sum + (dayChange * qty)
+    }, 0)
+    const totalInvested = holdings.reduce((sum, h) => {
+      const qty = parseFloat(h.quantity || h.realised_quantity || 0)
+      const avg = parseFloat(h.average_price || h.averageprice || 0)
+      return sum + (qty * avg)
+    }, 0)
+    const totalCurrent = holdings.reduce((sum, h) => {
+      const qty = parseFloat(h.quantity || h.realised_quantity || 0)
+      const ltp = parseFloat(h.last_price || h.ltp || 0)
+      return sum + (qty * ltp)
+    }, 0)
 
-              return (
-                <tr key={idx}>
-                  <td><strong>{hold.tradingsymbol || hold.symbol}</strong></td>
-                  <td>{qty}</td>
-                  <td>{formatCurrency(avgPrice)}</td>
-                  <td>{formatCurrency(ltp)}</td>
-                  <td>{formatCurrency(currentValue)}</td>
-                  <td>{formatPnL(pnl)}</td>
-                  <td style={{ color: pnlPercent >= 0 ? 'var(--success-color)' : 'var(--danger-color)' }}>
-                    {pnlPercent >= 0 ? '+' : ''}{pnlPercent.toFixed(2)}%
-                  </td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
+    return (
+      <div>
+        {/* Holdings Summary */}
+        <div className="grid grid-4" style={{ marginBottom: '1rem' }}>
+          <div className="stat-card">
+            <div className="stat-value">{formatCurrency(totalInvested)}</div>
+            <div className="stat-label">Invested</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-value">{formatCurrency(totalCurrent)}</div>
+            <div className="stat-label">Current Value</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-value" style={{ color: totalPnL >= 0 ? 'var(--success-color)' : 'var(--danger-color)' }}>
+              {totalPnL >= 0 ? '+' : ''}{formatCurrency(totalPnL)}
+            </div>
+            <div className="stat-label">Total P&L</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-value" style={{ color: daysPnL >= 0 ? 'var(--success-color)' : 'var(--danger-color)' }}>
+              {daysPnL >= 0 ? '+' : ''}{formatCurrency(daysPnL)}
+            </div>
+            <div className="stat-label">Day's P&L</div>
+          </div>
+        </div>
+
+        <div className="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Qty</th>
+                <th>Avg Price</th>
+                <th>LTP</th>
+                <th>Current Value</th>
+                <th>P&L</th>
+                <th>P&L %</th>
+                <th>Day Change</th>
+              </tr>
+            </thead>
+            <tbody>
+              {holdings.map((hold, idx) => {
+                // Match Zerodha API field names (with underscores)
+                const qty = parseFloat(hold.quantity || hold.realised_quantity || hold.realisedquantity || 0)
+                const avgPrice = parseFloat(hold.average_price || hold.averageprice || hold.avg_price || 0)
+                const ltp = parseFloat(hold.last_price || hold.ltp || hold.lastprice || hold.close_price || 0)
+                const dayChange = parseFloat(hold.day_change) || 0
+                const dayChangePercent = parseFloat(hold.day_change_percentage) || 0
+
+                // Use pre-calculated values from API if available, otherwise calculate
+                const currentValue = hold.current_value || (qty * ltp)
+                const investedValue = hold.invested_value || (qty * avgPrice)
+                const pnl = hold.pnl !== undefined ? hold.pnl : (currentValue - investedValue)
+                const pnlPercent = hold.pnl_percentage !== undefined
+                  ? hold.pnl_percentage
+                  : (investedValue > 0 ? ((pnl / investedValue) * 100) : 0)
+
+                return (
+                  <tr key={idx}>
+                    <td><strong>{hold.tradingsymbol || hold.symbol}</strong></td>
+                    <td>{qty}</td>
+                    <td>{formatCurrency(avgPrice)}</td>
+                    <td>{formatCurrency(ltp)}</td>
+                    <td>{formatCurrency(currentValue)}</td>
+                    <td>{formatPnL(pnl)}</td>
+                    <td style={{ color: pnlPercent >= 0 ? 'var(--success-color)' : 'var(--danger-color)' }}>
+                      {pnlPercent >= 0 ? '+' : ''}{parseFloat(pnlPercent).toFixed(2)}%
+                    </td>
+                    <td style={{ color: dayChange >= 0 ? 'var(--success-color)' : 'var(--danger-color)' }}>
+                      {dayChange >= 0 ? '+' : ''}{formatCurrency(dayChange)} ({dayChangePercent.toFixed(2)}%)
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
       </div>
     )
   }
