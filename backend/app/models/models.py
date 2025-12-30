@@ -41,13 +41,18 @@ class Trade(Base):
     broker_type = Column(String, default="angel_one", index=True)  # Broker used for this trade
     
     # Order execution details
-    order_id = Column(String, nullable=True)
-    status = Column(String, default="PENDING")  # PENDING, APPROVED, EXECUTED, REJECTED, FAILED
+    order_id = Column(String, nullable=True, index=True)  # Added index for faster lookup
+    status = Column(String, default="PENDING", index=True)  # Added index for status filtering
+    broker_status = Column(String, nullable=True)  # Real broker status: open, complete, rejected, cancelled, etc.
+    broker_rejection_reason = Column(Text, nullable=True)  # Reason if broker rejected the order
+    average_price = Column(Float, nullable=True)  # Actual fill price from broker
+    filled_quantity = Column(Integer, nullable=True)  # Quantity actually filled
     execution_price = Column(Float, nullable=True)
     execution_time = Column(DateTime, nullable=True)
+    last_status_check = Column(DateTime, nullable=True)  # When we last checked broker status
     
     # Timestamps
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)  # Added index for date filtering
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     # Additional info

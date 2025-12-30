@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import api from '../lib/api'
 
 function BrokerConfig() {
@@ -19,9 +19,20 @@ function BrokerConfig() {
   const [searchResults, setSearchResults] = useState([])
   const [searching, setSearching] = useState(false)
   const [error, setError] = useState(null)
+  const [dataLoaded, setDataLoaded] = useState(false)
+  const [lastUpdated, setLastUpdated] = useState({})
+  
+  // Track loading state per tab for progressive loading
+  const [tabLoading, setTabLoading] = useState({})
+  const abortControllerRef = useRef(null)
 
   useEffect(() => { fetchStatus(); fetchConfig() }, [])
-  useEffect(() => { if (status.is_logged_in) refreshAllData() }, [status.is_logged_in])
+  // Load data when logged in, but only once
+  useEffect(() => { 
+    if (status.is_logged_in && !dataLoaded) {
+      loadBrokerDataSequential()
+    }
+  }, [status.is_logged_in, dataLoaded])
 
   const fetchConfig = async () => {
     try {
@@ -46,43 +57,71 @@ function BrokerConfig() {
     }
   }
 
-  const refreshAllData = async () => {
+  // Load broker data sequentially to show results faster
+  const loadBrokerDataSequential = async () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    }
+    abortControllerRef.current = new AbortController()
+    const signal = abortControllerRef.current.signal
+    
     setRefreshing(true)
     setError(null)
+    
     try {
-      const [pos, hold, ord, fund, trades] = await Promise.all([
-        api.get('/broker/positions').catch(e => {
-          console.error('Positions error:', e.response?.data || e.message)
-          return { data: { data: [] } }
-        }),
-        api.get('/broker/holdings').catch(e => {
-          console.error('Holdings error:', e.response?.data || e.message)
-          return { data: { data: [] } }
-        }),
-        api.get('/broker/orders').catch(e => {
-          console.error('Orders error:', e.response?.data || e.message)
-          return { data: { data: [] } }
-        }),
-        api.get('/broker/funds').catch(e => {
-          console.error('Funds error:', e.response?.data || e.message)
-          return { data: { data: null } }
-        }),
-        api.get('/trades?status=PENDING,APPROVED').catch(e => {
-          console.error('Trades error:', e.response?.data || e.message)
-          return { data: [] }
-        })
-      ])
-      console.log('Broker data:', { positions: pos.data?.data?.length, holdings: hold.data?.data?.length, orders: ord.data?.data?.length, funds: !!fund.data?.data })
-      setPositions(pos.data?.data || [])
-      setHoldings(hold.data?.data || [])
-      setOrders(ord.data?.data || [])
-      setFunds(fund.data?.data || null)
-      setRunningTrades(Array.isArray(trades.data) ? trades.data : [])
+      // Load funds first (fastest, most important for display)
+      setTabLoading(p => ({ ...p, funds: true }))
+      const fundRes = await api.get('/broker/funds', { signal }).catch(() => ({ data: { data: null } }))
+      setFunds(fundRes.data?.data || null)
+      if (fundRes.data?.cached_at) setLastUpdated(p => ({ ...p, funds: fundRes.data.cached_at }))
+      setTabLoading(p => ({ ...p, funds: false }))
+      
+      // Then load positions (usually small dataset)
+      setTabLoading(p => ({ ...p, positions: true }))
+      const posRes = await api.get('/broker/positions', { signal }).catch(() => ({ data: { data: [] } }))
+      setPositions(posRes.data?.data || [])
+      if (posRes.data?.cached_at) setLastUpdated(p => ({ ...p, positions: posRes.data.cached_at }))
+      setTabLoading(p => ({ ...p, positions: false }))
+      
+      // Load pending trades
+      const tradesRes = await api.get('/trades?status=PENDING,APPROVED', { signal }).catch(() => ({ data: [] }))
+      setRunningTrades(Array.isArray(tradesRes.data) ? tradesRes.data : [])
+      
+      // Load orders
+      setTabLoading(p => ({ ...p, orders: true }))
+      const ordRes = await api.get('/broker/orders', { signal }).catch(() => ({ data: { data: [] } }))
+      setOrders(ordRes.data?.data || [])
+      if (ordRes.data?.cached_at) setLastUpdated(p => ({ ...p, orders: ordRes.data.cached_at }))
+      setTabLoading(p => ({ ...p, orders: false }))
+      
+      // Holdings last (slowest due to LTP enrichment)
+      setTabLoading(p => ({ ...p, holdings: true }))
+      const holdRes = await api.get('/broker/holdings', { signal }).catch(() => ({ data: { data: [] } }))
+      setHoldings(holdRes.data?.data || [])
+      if (holdRes.data?.cached_at) setLastUpdated(p => ({ ...p, holdings: holdRes.data.cached_at }))
+      setTabLoading(p => ({ ...p, holdings: false }))
+      
+      setDataLoaded(true)
     } catch (e) {
-      console.error('Error refreshing data:', e)
-      setError('Failed to load broker data: ' + (e.response?.data?.detail || e.message))
+      if (e.name !== 'AbortError' && e.name !== 'CanceledError') {
+        console.error('Error loading broker data:', e)
+        setError('Failed to load some broker data')
+      }
     }
     setRefreshing(false)
+  }
+
+  const refreshAllData = async () => {
+    setDataLoaded(false)
+    await loadBrokerDataSequential()
+  }
+
+  const formatLastUpdated = (timestamp) => {
+    if (!timestamp) return ''
+    const seconds = Math.floor(Date.now() / 1000 - timestamp)
+    if (seconds < 5) return '🟢 Live'
+    if (seconds < 30) return `🟡 ${seconds}s ago`
+    return `🔴 ${seconds}s ago`
   }
 
   const handleConfigSubmit = async (e) => {
@@ -276,9 +315,16 @@ function BrokerConfig() {
                 </button>
               ))}
             </div>
-            <button onClick={refreshAllData} className="btn" disabled={refreshing}>
-              {refreshing ? '↻ Refreshing...' : '↻ Refresh'}
-            </button>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+              {lastUpdated[activeTab] && (
+                <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                  {formatLastUpdated(lastUpdated[activeTab])}
+                </span>
+              )}
+              <button onClick={refreshAllData} className="btn" disabled={refreshing}>
+                {refreshing ? '↻ Refreshing...' : '↻ Refresh'}
+              </button>
+            </div>
           </div>
 
           {/* Positions Tab */}

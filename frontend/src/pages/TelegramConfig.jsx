@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import axios from 'axios'
+import api from '../lib/api'
 
 // Helper to get WebSocket URL
 const getWebSocketUrl = () => {
@@ -170,7 +170,7 @@ function TelegramConfig() {
 
   const fetchConfig = async () => {
     try {
-      const response = await axios.get('/api/telegram/config')
+      const response = await api.get('/telegram/config')
       setConfig(response.data)
       fetchChats()
     } catch (error) {
@@ -180,7 +180,7 @@ function TelegramConfig() {
 
   const fetchConnectionStatus = async () => {
     try {
-      const response = await axios.get('/api/telegram/status')
+      const response = await api.get('/telegram/status')
       setConnectionStatus(response.data)
     } catch (error) {
       console.error('Error fetching status:', error)
@@ -189,7 +189,7 @@ function TelegramConfig() {
 
   const fetchMessageStats = async () => {
     try {
-      const response = await axios.get('/api/telegram/messages/stats')
+      const response = await api.get('/telegram/messages/stats')
       setMessageStats(response.data)
     } catch (error) {
       console.error('Error fetching stats:', error)
@@ -198,7 +198,7 @@ function TelegramConfig() {
 
   const fetchChats = async () => {
     try {
-      const response = await axios.get('/api/telegram/chats')
+      const response = await api.get('/telegram/chats')
       setAvailableChats(response.data.chats)
     } catch (error) {
       console.error('Error fetching chats:', error)
@@ -208,11 +208,11 @@ function TelegramConfig() {
   const fetchMessages = async (showLoading = false) => {
     if (showLoading) setLoading(true)
     try {
-      let url = '/api/telegram/messages?limit=100' // Increased limit
+      let url = '/telegram/messages?limit=100' // Increased limit
       if (filterSignalsOnly) {
         url += '&unprocessed_only=true'
       }
-      const response = await axios.get(url)
+      const response = await api.get(url)
       const fetchedMessages = response.data || []
       setMessages(fetchedMessages)
       
@@ -240,8 +240,8 @@ function TelegramConfig() {
     
     setFetchingHistory(true)
     try {
-      const response = await axios.get(
-        `/api/telegram/history/${selectedChatForHistory}?limit=${historyLimit}&save_to_db=${saveToDb}`
+      const response = await api.get(
+        `/telegram/history/${selectedChatForHistory}?limit=${historyLimit}&save_to_db=${saveToDb}`
       )
       
       if (saveToDb) {
@@ -263,8 +263,8 @@ function TelegramConfig() {
     setLoading(true)
 
     try {
-      await axios.post('/api/telegram/config', config)
-      const initResponse = await axios.post('/api/telegram/initialize')
+      await api.post('/telegram/config', config)
+      const initResponse = await api.post('/telegram/initialize')
       
       if (initResponse.data.status === 'code_sent') {
         setNeedsVerification(true)
@@ -290,7 +290,7 @@ function TelegramConfig() {
     setLoading(true)
 
     try {
-      const response = await axios.post('/api/telegram/verify-code', null, {
+      const response = await api.post('/telegram/verify-code', null, {
         params: { phone: config.phone_number, code: verificationCode }
       })
       
@@ -322,13 +322,13 @@ function TelegramConfig() {
     setLoading(true)
     try {
       // First save the config
-      await axios.post('/api/telegram/config', config)
+      await api.post('/telegram/config', config)
       
       // Give the database a moment to commit
       await new Promise(resolve => setTimeout(resolve, 100))
       
       // Then reload Telegram service to pick up new monitored chats
-      const reloadRes = await axios.post('/api/telegram/reload')
+      const reloadRes = await api.post('/telegram/reload')
       
       // Update local connection status
       setConnectionStatus(reloadRes.data)
@@ -359,7 +359,7 @@ function TelegramConfig() {
   const reloadTelegramService = async () => {
     setLoading(true)
     try {
-      const response = await axios.post('/api/telegram/reload')
+      const response = await api.post('/telegram/reload')
       alert(`Telegram service reloaded! Monitoring ${response.data.monitored_chats_count} chats.`)
       fetchConnectionStatus()
     } catch (error) {
@@ -377,7 +377,7 @@ function TelegramConfig() {
     
     try {
       // Fetch signal details with broker status
-      const response = await axios.get(`/api/telegram/messages/${message.id}/signal`)
+      const response = await api.get(`/telegram/messages/${message.id}/signal`)
       const signalData = response.data
       
       // Set form values from signal
@@ -415,8 +415,8 @@ function TelegramConfig() {
     setTradeResult(null)
     
     try {
-      const response = await axios.post(
-        `/api/telegram/messages/${selectedMessage.id}/execute`,
+      const response = await api.post(
+        `/telegram/messages/${selectedMessage.id}/execute`,
         tradeForm
       )
       
@@ -1832,3 +1832,4 @@ function TelegramConfig() {
 }
 
 export default TelegramConfig
+

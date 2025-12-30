@@ -9,6 +9,7 @@ Supports:
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import Optional
+import time
 
 from app.core.database import get_db
 from app.core.encryption import get_encryption_manager
@@ -24,6 +25,41 @@ router = APIRouter()
 
 # Get encryption manager for credential encryption/decryption
 encryption_manager = get_encryption_manager()
+
+# Differentiated cache TTL based on data criticality
+# Real-time trading data: 5 seconds (positions, orders, funds)
+# Moderate refresh: 30 seconds (holdings - delivery stocks change less frequently)
+# Static data: 300 seconds (broker configs, symbol master)
+_broker_cache = {}
+CACHE_TTL_CRITICAL = 5      # positions, orders, funds
+CACHE_TTL_MODERATE = 30     # holdings
+CACHE_TTL_STATIC = 300      # configs, broker list
+
+def get_cached_broker_data(key: str):
+    """Get data from cache if not expired. Returns (data, cached_at) or None"""
+    if key in _broker_cache:
+        data, cached_at, expires = _broker_cache[key]
+        if time.time() < expires:
+            return (data, cached_at)
+    return None
+
+def set_cached_broker_data(key: str, data, ttl: int = CACHE_TTL_CRITICAL):
+    """Set data in cache with TTL and timestamp"""
+    cached_at = time.time()
+    _broker_cache[key] = (data, cached_at, cached_at + ttl)
+
+def clear_broker_cache():
+    """Clear all broker cache"""
+    global _broker_cache
+    _broker_cache = {}
+
+def force_refresh_broker_data():
+    """Force refresh of critical trading data before order execution"""
+    # Clear only critical data that needs to be fresh for trading decisions
+    keys_to_clear = ['positions', 'orders', 'funds']
+    for key in keys_to_clear:
+        if key in _broker_cache:
+            del _broker_cache[key]
 
 
 @router.post("/config", response_model=BrokerConfigResponse)
@@ -260,6 +296,13 @@ async def broker_status(db: Session = Depends(get_db)):
 @router.get("/positions")
 async def get_positions(db: Session = Depends(get_db)):
     """Get current positions from active broker"""
+    # Check cache first (5 second TTL)
+    cached_data = get_cached_broker_data('positions')
+    if cached_data:
+        result, cached_at = cached_data
+        result['cached_at'] = cached_at
+        return result
+    
     # Get active broker
     settings = db.query(AppSettings).first()
     if not settings or not settings.active_broker_type:
@@ -267,6 +310,8 @@ async def get_positions(db: Session = Depends(get_db)):
         result = broker_service.get_positions()
         if result.get('status') == 'error':
             raise HTTPException(status_code=400, detail=result.get('message', 'Not logged in'))
+        set_cached_broker_data('positions', result, CACHE_TTL_CRITICAL)
+        result['cached_at'] = time.time()
         return result
     
     # Use active broker
@@ -277,12 +322,21 @@ async def get_positions(db: Session = Depends(get_db)):
     result = broker.get_positions()
     if result.get('status') == 'error':
         raise HTTPException(status_code=400, detail=result.get('message', 'Failed to fetch positions'))
+    set_cached_broker_data('positions', result, CACHE_TTL_CRITICAL)
+    result['cached_at'] = time.time()
     return result
 
 
 @router.get("/holdings")
 async def get_holdings(db: Session = Depends(get_db)):
     """Get long-term holdings (delivery stocks) from active broker with current prices"""
+    # Check cache first (30 second TTL - holdings change less frequently)
+    cached_data = get_cached_broker_data('holdings')
+    if cached_data:
+        result, cached_at = cached_data
+        result['cached_at'] = cached_at
+        return result
+    
     # Get active broker
     settings = db.query(AppSettings).first()
     if not settings or not settings.active_broker_type:
@@ -290,6 +344,8 @@ async def get_holdings(db: Session = Depends(get_db)):
         result = broker_service.get_holdings()
         if result.get('status') == 'error':
             raise HTTPException(status_code=400, detail=result.get('message', 'Not logged in'))
+        set_cached_broker_data('holdings', result, CACHE_TTL_MODERATE)
+        result['cached_at'] = time.time()
         return result
     
     # Use active broker
@@ -301,42 +357,21 @@ async def get_holdings(db: Session = Depends(get_db)):
     if result.get('status') == 'error':
         raise HTTPException(status_code=400, detail=result.get('message', 'Failed to fetch holdings'))
     
-    # Enrich holdings with current prices if data is available
+    # Process holdings - calculate P&L using available data only (no additional API calls)
     holdings = result.get('data', [])
     if holdings and isinstance(holdings, list):
         enriched_holdings = []
         for holding in holdings:
             try:
-                # Get symbol and exchange from holding
-                symbol = holding.get('tradingsymbol') or holding.get('symbol')
-                exchange = holding.get('exchange', 'NSE')
-                
-                # First check if holding already has price data (Zerodha includes it)
+                # Use price data already included in the holding (most brokers include this)
                 current_price = (
                     holding.get('last_price') or 
                     holding.get('ltp') or 
                     holding.get('lastprice') or
-                    holding.get('close_price')
+                    holding.get('close_price') or
+                    holding.get('close') or
+                    0
                 )
-                
-                # Only fetch LTP via API if price not already in holding data
-                if not current_price and symbol:
-                    try:
-                        ltp_result = broker.get_ltp(symbol, exchange)
-                        if ltp_result is not None:
-                            if isinstance(ltp_result, (int, float)):
-                                current_price = float(ltp_result)
-                            elif isinstance(ltp_result, dict):
-                                if ltp_result.get('status') == 'success':
-                                    ltp_data = ltp_result.get('data', {})
-                                    if isinstance(ltp_data, dict):
-                                        current_price = ltp_data.get('ltp') or ltp_data.get('last_price')
-                                    elif isinstance(ltp_data, (int, float)):
-                                        current_price = float(ltp_data)
-                                else:
-                                    current_price = ltp_result.get('ltp') or ltp_result.get('last_price')
-                    except Exception:
-                        pass  # Silently ignore LTP fetch failures
                 
                 if current_price:
                     current_price = float(current_price)
@@ -360,18 +395,26 @@ async def get_holdings(db: Session = Depends(get_db)):
                         holding['invested_value'] = round(avg_price * quantity, 2)
                 
                 enriched_holdings.append(holding)
-            except Exception as e:
-                # If processing fails, just add the holding as-is
+            except Exception:
                 enriched_holdings.append(holding)
         
         result['data'] = enriched_holdings
     
+    set_cached_broker_data('holdings', result, CACHE_TTL_MODERATE)
+    result['cached_at'] = time.time()
     return result
 
 
 @router.get("/orders")
 async def get_order_book(db: Session = Depends(get_db)):
     """Get all orders for today from active broker"""
+    # Check cache first (5 second TTL)
+    cached_data = get_cached_broker_data('orders')
+    if cached_data:
+        result, cached_at = cached_data
+        result['cached_at'] = cached_at
+        return result
+    
     # Get active broker
     settings = db.query(AppSettings).first()
     if not settings or not settings.active_broker_type:
@@ -379,6 +422,8 @@ async def get_order_book(db: Session = Depends(get_db)):
         result = broker_service.get_order_book()
         if result.get('status') == 'error':
             raise HTTPException(status_code=400, detail=result.get('message', 'Not logged in'))
+        set_cached_broker_data('orders', result, CACHE_TTL_CRITICAL)
+        result['cached_at'] = time.time()
         return result
     
     # Use active broker
@@ -389,12 +434,21 @@ async def get_order_book(db: Session = Depends(get_db)):
     result = broker.get_order_book()
     if result.get('status') == 'error':
         raise HTTPException(status_code=400, detail=result.get('message', 'Failed to fetch orders'))
+    set_cached_broker_data('orders', result, CACHE_TTL_CRITICAL)
+    result['cached_at'] = time.time()
     return result
 
 
 @router.get("/funds")
 async def get_funds(db: Session = Depends(get_db)):
     """Get account funds and margin from active broker"""
+    # Check cache first (5 second TTL)
+    cached_data = get_cached_broker_data('funds')
+    if cached_data:
+        result, cached_at = cached_data
+        result['cached_at'] = cached_at
+        return result
+    
     # Get active broker
     settings = db.query(AppSettings).first()
     if not settings or not settings.active_broker_type:
@@ -402,6 +456,8 @@ async def get_funds(db: Session = Depends(get_db)):
         result = broker_service.get_funds()
         if result.get('status') == 'error':
             raise HTTPException(status_code=400, detail=result.get('message', 'Not logged in'))
+        set_cached_broker_data('funds', result, CACHE_TTL_CRITICAL)
+        result['cached_at'] = time.time()
         return result
     
     # Use active broker
@@ -412,6 +468,8 @@ async def get_funds(db: Session = Depends(get_db)):
     result = broker.get_funds()
     if result.get('status') == 'error':
         raise HTTPException(status_code=400, detail=result.get('message', 'Failed to fetch funds'))
+    set_cached_broker_data('funds', result, CACHE_TTL_CRITICAL)
+    result['cached_at'] = time.time()
     return result
 
 
@@ -606,6 +664,9 @@ async def login_specific_broker(broker_type: str, db: Session = Depends(get_db))
         )
     
     if result['status'] == 'success':
+        # Clear broker cache on successful login
+        clear_broker_cache()
+        
         # Update last login
         from datetime import datetime
         config.last_login = datetime.utcnow()
@@ -623,6 +684,9 @@ async def logout_specific_broker(broker_type: str):
     
     broker = broker_registry.create_broker(broker_type)
     broker.logout()
+    
+    # Clear broker cache on logout
+    clear_broker_cache()
     
     return {
         "status": "success",

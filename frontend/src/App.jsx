@@ -137,8 +137,8 @@ function App() {
       }
     })
 
-    // Connect
-    wsManager.current.connect().catch(console.error)
+    // WebSocket connects automatically in constructor
+    // No need to call connect() manually
 
     // Periodic status refresh every 30 seconds
     const statusInterval = setInterval(() => {

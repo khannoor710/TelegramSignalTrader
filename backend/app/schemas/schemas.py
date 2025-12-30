@@ -127,8 +127,13 @@ class TradeResponse(BaseModel):
     product_type: str
     order_id: Optional[str] = None
     status: str
+    broker_status: Optional[str] = None  # Real status from broker
+    broker_rejection_reason: Optional[str] = None  # Rejection reason from broker
+    average_price: Optional[float] = None  # Actual fill price
+    filled_quantity: Optional[int] = None  # Quantity filled
     execution_price: Optional[float] = None
     execution_time: Optional[datetime] = None
+    last_status_check: Optional[datetime] = None  # When status was last synced
     created_at: datetime
     notes: Optional[str] = None
     error_message: Optional[str] = None

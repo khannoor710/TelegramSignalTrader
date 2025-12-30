@@ -1,35 +1,134 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import api from '../lib/api'
 
 function Dashboard({ telegramStatus, brokerStatus, wsConnected }) {
-  const [stats, setStats] = useState({ total: 0, executed: 0, pending: 0, failed: 0, today: 0, limit: 10, remaining: 10 })
+  const [stats, setStats] = useState({ total: 0, executed: 0, pending: 0, failed: 0, rejected: 0, open: 0, today: 0, limit: 10, remaining: 10 })
   const [recentTrades, setRecentTrades] = useState([])
   const [messageStats, setMessageStats] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [syncing, setSyncing] = useState(false)
+  
+  // Use ref to prevent multiple simultaneous fetches
+  const isFetchingRef = useRef(false)
+  const abortControllerRef = useRef(null)
 
-  useEffect(() => {
-    fetchData()
-    const interval = setInterval(fetchData, 10000) // Refresh every 10 seconds
-    return () => clearInterval(interval)
-  }, [])
-
-  const fetchData = async () => {
+  // Memoized fetch function with abort capability
+  const fetchData = useCallback(async () => {
+    // Prevent overlapping fetches
+    if (isFetchingRef.current) return
+    isFetchingRef.current = true
+    
+    // Abort any previous pending request
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    }
+    abortControllerRef.current = new AbortController()
+    
     try {
       const [statsRes, tradesRes, msgStatsRes] = await Promise.all([
-        api.get('/trades/stats/summary'),
-        api.get('/trades?limit=5'),
-        api.get('/telegram/messages/stats').catch(() => ({ data: null }))
+        api.get('/trades/stats/summary', { signal: abortControllerRef.current.signal }),
+        api.get('/trades?limit=5', { signal: abortControllerRef.current.signal }),
+        api.get('/telegram/messages/stats', { signal: abortControllerRef.current.signal }).catch(() => ({ data: null }))
       ])
 
       setStats(statsRes.data)
       setRecentTrades(tradesRes.data)
       setMessageStats(msgStatsRes.data)
     } catch (error) {
-      console.error('Error fetching data:', error)
+      // Ignore abort errors
+      if (error.name !== 'AbortError' && error.name !== 'CanceledError') {
+        console.error('Error fetching data:', error)
+      }
     } finally {
       setLoading(false)
+      isFetchingRef.current = false
     }
+  }, [])
+
+  useEffect(() => {
+    fetchData()
+    // Increase polling interval to 30 seconds (was 10) - reduces server load
+    const interval = setInterval(fetchData, 30000)
+    return () => {
+      clearInterval(interval)
+      // Cleanup: abort any pending requests
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort()
+      }
+    }
+  }, [fetchData])
+
+  const syncOrderStatuses = async () => {
+    setSyncing(true)
+    try {
+      const response = await api.post('/trades/sync-status')
+      if (response.data.updated > 0) {
+        alert(`Synced ${response.data.updated} trades with broker status`)
+      } else {
+        alert('All trades are up to date')
+      }
+      fetchData() // Refresh data after sync
+    } catch (error) {
+      alert(`Sync failed: ${error.response?.data?.detail || error.message}`)
+    } finally {
+      setSyncing(false)
+    }
+  }
+
+  const getStatusBadge = (trade) => {
+    const status = trade.status
+    const brokerStatus = trade.broker_status
+    
+    let badgeClass = 'badge-pending'
+    let displayText = status
+    let title = ''
+    
+    switch (status) {
+      case 'EXECUTED':
+        badgeClass = 'badge-success'
+        displayText = '✓ Executed'
+        if (trade.average_price) {
+          title = `Filled at ₹${trade.average_price}`
+        }
+        break
+      case 'REJECTED':
+        badgeClass = 'badge-danger'
+        displayText = '✗ Rejected'
+        title = trade.broker_rejection_reason || trade.error_message || 'Order rejected by broker'
+        break
+      case 'CANCELLED':
+        badgeClass = 'badge-secondary'
+        displayText = '⊘ Cancelled'
+        break
+      case 'FAILED':
+        badgeClass = 'badge-danger'
+        displayText = '✗ Failed'
+        title = trade.error_message || 'Order failed'
+        break
+      case 'OPEN':
+        badgeClass = 'badge-warning'
+        displayText = '⏳ Open'
+        title = 'Order is open at broker, waiting to be filled'
+        break
+      case 'SUBMITTED':
+        badgeClass = 'badge-pending'
+        displayText = '📤 Submitted'
+        title = 'Order submitted, checking status...'
+        break
+      case 'PENDING':
+        badgeClass = 'badge-pending'
+        displayText = '⏱ Pending'
+        break
+      default:
+        displayText = status
+    }
+    
+    return (
+      <span className={`badge ${badgeClass}`} title={title} style={{ cursor: title ? 'help' : 'default' }}>
+        {displayText}
+      </span>
+    )
   }
 
 
@@ -283,12 +382,12 @@ function Dashboard({ telegramStatus, brokerStatus, wsConnected }) {
           <p>Executed</p>
         </div>
         <div className="stat-card">
-          <h3 style={{ color: 'var(--warning-color)' }}>{stats.pending}</h3>
-          <p>Pending</p>
+          <h3 style={{ color: 'var(--warning-color)' }}>{stats.pending + (stats.open || 0)}</h3>
+          <p>Pending/Open</p>
         </div>
         <div className="stat-card">
-          <h3 style={{ color: 'var(--danger-color)' }}>{stats.failed}</h3>
-          <p>Failed</p>
+          <h3 style={{ color: 'var(--danger-color)' }}>{stats.failed + (stats.rejected || 0)}</h3>
+          <p>Failed/Rejected</p>
         </div>
         {messageStats && (
           <>
@@ -317,6 +416,14 @@ function Dashboard({ telegramStatus, brokerStatus, wsConnected }) {
           <Link to="/signal-tester" className="btn">
             🧪 Test Signal Parser
           </Link>
+          <button 
+            onClick={syncOrderStatuses} 
+            className="btn" 
+            disabled={syncing || !brokerStatus?.is_logged_in}
+            style={{ opacity: syncing ? 0.7 : 1 }}
+          >
+            {syncing ? '🔄 Syncing...' : '🔄 Sync Order Status'}
+          </button>
           {messageStats?.unprocessed_signals > 0 && (
             <Link to="/telegram" className="btn" style={{ backgroundColor: 'var(--warning-color)', color: 'white' }}>
               ⚠️ {messageStats.unprocessed_signals} Pending Signals
@@ -364,11 +471,12 @@ function Dashboard({ telegramStatus, brokerStatus, wsConnected }) {
                     </td>
                     <td>{trade.quantity}</td>
                     <td>
-                      <span className={`badge badge-${trade.status === 'EXECUTED' ? 'success' :
-                          trade.status === 'PENDING' ? 'pending' : 'danger'
-                        }`}>
-                        {trade.status}
-                      </span>
+                      {getStatusBadge(trade)}
+                      {trade.broker_status && trade.broker_status !== trade.status.toLowerCase() && (
+                        <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block', marginTop: '2px' }}>
+                          ({trade.broker_status})
+                        </span>
+                      )}
                     </td>
                     <td style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
                       {new Date(trade.created_at).toLocaleString()}

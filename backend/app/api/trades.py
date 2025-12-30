@@ -13,8 +13,12 @@ from app.schemas.schemas import (
     TradeApproval
 )
 from app.models.models import Trade, AppSettings
-from app.services.broker_service import broker_service
+from app.services.broker_service import broker_service, symbol_master
+from app.services.symbol_resolver import get_symbol_resolver
 from app.services.websocket_manager import WebSocketManager
+from app.core.logging_config import get_logger
+
+logger = get_logger("trades_api")
 
 router = APIRouter()
 
@@ -58,9 +62,27 @@ async def create_trade(trade: TradeCreate, db: Session = Depends(get_db)):
     if quantity <= 0 and settings:
         quantity = settings.default_quantity
     
+    # === Symbol Resolution at Creation ===
+    # Resolve generic signal symbol to correct broker-compatible format
+    original_symbol = trade.symbol.upper()
+    resolved_symbol = original_symbol
+    notes = None
+    
+    resolver = get_symbol_resolver(symbol_master)
+    resolution_result = resolver.resolve_symbol(
+        raw_symbol=original_symbol,
+        exchange=trade.exchange
+    )
+    
+    if resolution_result.get("success") and resolution_result.get("resolved_symbol"):
+        resolved_symbol = resolution_result["resolved_symbol"]
+        if resolved_symbol != original_symbol:
+            notes = f"Symbol resolved: {original_symbol} → {resolved_symbol}"
+            logger.info(f"🔍 {notes}")
+    
     db_trade = Trade(
         message_id=trade.message_id,
-        symbol=trade.symbol.upper(),  # Normalize symbol to uppercase
+        symbol=resolved_symbol,  # Use resolved symbol
         action=trade.action.upper(),  # Normalize action
         quantity=quantity,
         entry_price=trade.entry_price,
@@ -69,7 +91,8 @@ async def create_trade(trade: TradeCreate, db: Session = Depends(get_db)):
         order_type=trade.order_type,
         exchange=trade.exchange,
         product_type=trade.product_type,
-        status="PENDING"
+        status="PENDING",
+        notes=notes  # Store resolution info
     )
     
     db.add(db_trade)
@@ -114,6 +137,58 @@ async def get_trades(
     return trades
 
 
+# ====== Static routes (must be defined before /{trade_id}) ======
+
+@router.post("/resolve-symbol")
+async def resolve_symbol(
+    symbol: str,
+    exchange: str = "NSE"
+):
+    """
+    Test symbol resolution - convert generic signal name to broker-compatible format
+    
+    Examples:
+    - symbol="RELIANCE" → "RELIANCE-EQ"
+    - symbol="NIFTY 25000 CE" → "NIFTY25DEC25000CE"
+    - symbol="TCS" → "TCS-EQ"
+    """
+    resolver = get_symbol_resolver(symbol_master)
+    result = resolver.resolve_symbol(raw_symbol=symbol, exchange=exchange)
+    
+    return {
+        "original": symbol,
+        "resolved": result.get("resolved_symbol"),
+        "token": result.get("token"),
+        "exchange": result.get("exchange"),
+        "instrument_type": result.get("instrument_type"),
+        "success": result.get("success"),
+        "message": result.get("message")
+    }
+
+
+@router.get("/search-symbols")
+async def search_symbols(
+    query: str,
+    exchange: str = "NSE",
+    limit: int = 10
+):
+    """
+    Search for symbols matching a query
+    Returns matching instruments from the symbol master
+    """
+    if not symbol_master:
+        raise HTTPException(status_code=500, detail="Symbol master not initialized")
+    
+    results = symbol_master.search_symbol(query, exchange, limit=limit)
+    return {
+        "query": query,
+        "exchange": exchange,
+        "count": len(results),
+        "results": results
+    }
+
+# ====== Dynamic routes (/{trade_id} patterns) ======
+
 @router.get("/{trade_id}", response_model=TradeResponse)
 async def get_trade(trade_id: int, db: Session = Depends(get_db)):
     """Get specific trade"""
@@ -157,6 +232,10 @@ async def approve_trade(approval: TradeApproval, db: Session = Depends(get_db)):
 
 async def execute_trade_internal(trade_id: int, db: Session):
     """Internal function to execute trade"""
+    # Force refresh critical broker data before trade execution
+    from app.api.broker import force_refresh_broker_data
+    force_refresh_broker_data()
+    
     trade = db.query(Trade).filter(Trade.id == trade_id).first()
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
@@ -167,7 +246,29 @@ async def execute_trade_internal(trade_id: int, db: Session):
         db.commit()
         raise HTTPException(status_code=400, detail="Broker not logged in")
     
-    # Place order
+    # === Symbol Resolution ===
+    # Resolve generic signal symbol to correct broker-compatible format
+    resolver = get_symbol_resolver(symbol_master)
+    original_symbol = trade.symbol
+    resolution_result = resolver.resolve_symbol(
+        raw_symbol=trade.symbol,
+        exchange=trade.exchange
+    )
+    
+    if resolution_result.get("success"):
+        resolved_symbol = resolution_result["resolved_symbol"]
+        logger.info(f"🔍 Symbol resolved: {original_symbol} → {resolved_symbol}")
+        
+        # Update trade with resolved symbol if different
+        if resolved_symbol != original_symbol:
+            trade.notes = f"Symbol resolved: {original_symbol} → {resolved_symbol}"
+            trade.symbol = resolved_symbol
+            db.flush()  # Update in session
+    else:
+        logger.warning(f"⚠️ Symbol resolution warning: {resolution_result.get('message')}")
+        # Continue with original symbol, but log the warning
+    
+    # Place order with resolved symbol
     result = broker_service.place_order(
         symbol=trade.symbol,
         action=trade.action,
@@ -179,18 +280,45 @@ async def execute_trade_internal(trade_id: int, db: Session):
     )
     
     if result['status'] == 'success':
-        trade.status = "EXECUTED"
         trade.order_id = result['order_id']
+        trade.status = "SUBMITTED"  # Changed from EXECUTED - order is submitted, not executed yet
         trade.execution_time = datetime.utcnow()
-        trade.execution_price = trade.entry_price  # Will be updated when order fills
+        
+        # Immediately check actual order status from broker
+        import asyncio
+        await asyncio.sleep(1)  # Brief delay to let broker process
+        order_status = broker_service.get_order_status(result['order_id'])
+        
+        if order_status.get('status') == 'success':
+            trade.broker_status = order_status.get('broker_status')
+            trade.filled_quantity = order_status.get('filled_quantity')
+            trade.average_price = order_status.get('average_price')
+            trade.last_status_check = datetime.utcnow()
+            
+            # Update internal status based on broker status
+            internal_status = order_status.get('internal_status', 'PENDING')
+            if internal_status == 'EXECUTED':
+                trade.status = "EXECUTED"
+                trade.execution_price = order_status.get('average_price') or trade.entry_price
+            elif internal_status == 'REJECTED':
+                trade.status = "REJECTED"
+                trade.broker_rejection_reason = order_status.get('rejection_reason')
+                trade.error_message = order_status.get('rejection_reason')
+            elif internal_status == 'CANCELLED':
+                trade.status = "CANCELLED"
+            else:
+                trade.status = "OPEN"  # Order is open/pending at broker
         
         # Notify via WebSocket
         if ws_manager:
             await ws_manager.broadcast({
-                "type": "trade_executed",
+                "type": "trade_status_update",
                 "data": {
                     "trade_id": trade.id,
-                    "order_id": result['order_id']
+                    "order_id": result['order_id'],
+                    "status": trade.status,
+                    "broker_status": trade.broker_status,
+                    "rejection_reason": trade.broker_rejection_reason
                 }
             })
     else:
@@ -211,30 +339,181 @@ async def execute_trade(trade_id: int, db: Session = Depends(get_db)):
 
 @router.get("/stats/summary")
 async def get_trade_stats(db: Session = Depends(get_db)):
-    """Get trade statistics"""
+    """Get trade statistics - optimized single query"""
     from datetime import date
+    from sqlalchemy import func, case
     today = date.today()
+    today_start = datetime(today.year, today.month, today.day)
     
-    total_trades = db.query(Trade).count()
-    executed_trades = db.query(Trade).filter(Trade.status == "EXECUTED").count()
-    pending_trades = db.query(Trade).filter(Trade.status == "PENDING").count()
-    failed_trades = db.query(Trade).filter(Trade.status == "FAILED").count()
-    
-    # Today's trades
-    today_trades = db.query(Trade).filter(
-        Trade.created_at >= datetime(today.year, today.month, today.day)
-    ).count()
+    # Single query with conditional counts (much faster than 7 separate queries)
+    stats = db.query(
+        func.count(Trade.id).label('total'),
+        func.sum(case((Trade.status == "EXECUTED", 1), else_=0)).label('executed'),
+        func.sum(case((Trade.status == "PENDING", 1), else_=0)).label('pending'),
+        func.sum(case((Trade.status == "FAILED", 1), else_=0)).label('failed'),
+        func.sum(case((Trade.status == "REJECTED", 1), else_=0)).label('rejected'),
+        func.sum(case((Trade.status == "OPEN", 1), else_=0)).label('open'),
+        func.sum(case((Trade.created_at >= today_start, 1), else_=0)).label('today')
+    ).first()
     
     # Get settings for limit info
     settings = db.query(AppSettings).first()
     max_trades = settings.max_trades_per_day if settings else 10
+    today_count = stats.today or 0
     
     return {
-        "total": total_trades,
-        "executed": executed_trades,
-        "pending": pending_trades,
-        "failed": failed_trades,
-        "today": today_trades,
+        "total": stats.total or 0,
+        "executed": stats.executed or 0,
+        "pending": stats.pending or 0,
+        "failed": stats.failed or 0,
+        "rejected": stats.rejected or 0,
+        "open": stats.open or 0,
+        "today": today_count,
         "limit": max_trades,
-        "remaining": max(0, max_trades - today_trades)
+        "remaining": max(0, max_trades - today_count)
     }
+
+
+@router.post("/sync-status")
+async def sync_all_order_statuses(db: Session = Depends(get_db)):
+    """Sync status of all open/submitted orders from broker"""
+    if not broker_service.is_logged_in:
+        raise HTTPException(status_code=400, detail="Broker not logged in")
+    
+    # Get all trades with order_id that are not in final state
+    trades_to_sync = db.query(Trade).filter(
+        Trade.order_id.isnot(None),
+        Trade.status.in_(["SUBMITTED", "OPEN", "PENDING", "EXECUTED"])  # Include EXECUTED to verify
+    ).all()
+    
+    if not trades_to_sync:
+        return {"status": "success", "message": "No trades to sync", "updated": 0}
+    
+    # Get all orders from broker
+    order_book = broker_service.get_all_order_statuses()
+    
+    if order_book.get('status') != 'success':
+        raise HTTPException(status_code=500, detail=order_book.get('message', 'Failed to fetch orders'))
+    
+    broker_orders = {str(o['order_id']): o for o in order_book.get('orders', [])}
+    
+    updated_count = 0
+    updates = []
+    
+    for trade in trades_to_sync:
+        broker_order = broker_orders.get(str(trade.order_id))
+        
+        if broker_order:
+            old_status = trade.status
+            broker_status = broker_order.get('broker_status')
+            internal_status = broker_order.get('internal_status')
+            
+            # Update trade with broker data
+            trade.broker_status = broker_status
+            trade.filled_quantity = broker_order.get('filled_quantity')
+            trade.average_price = broker_order.get('average_price')
+            trade.last_status_check = datetime.utcnow()
+            
+            # Update internal status if changed
+            if internal_status == 'EXECUTED' and trade.status != 'EXECUTED':
+                trade.status = "EXECUTED"
+                trade.execution_price = broker_order.get('average_price') or trade.entry_price
+            elif internal_status == 'REJECTED' and trade.status != 'REJECTED':
+                trade.status = "REJECTED"
+                trade.broker_rejection_reason = broker_order.get('rejection_reason')
+                trade.error_message = broker_order.get('rejection_reason')
+            elif internal_status == 'CANCELLED' and trade.status != 'CANCELLED':
+                trade.status = "CANCELLED"
+            elif internal_status == 'OPEN' and trade.status not in ['EXECUTED', 'REJECTED', 'CANCELLED']:
+                trade.status = "OPEN"
+            
+            if old_status != trade.status:
+                updated_count += 1
+                updates.append({
+                    "trade_id": trade.id,
+                    "order_id": trade.order_id,
+                    "old_status": old_status,
+                    "new_status": trade.status,
+                    "broker_status": broker_status,
+                    "rejection_reason": trade.broker_rejection_reason
+                })
+    
+    db.commit()
+    
+    # Notify via WebSocket about updates
+    if ws_manager and updates:
+        await ws_manager.broadcast({
+            "type": "trades_synced",
+            "data": {
+                "updated_count": updated_count,
+                "updates": updates
+            }
+        })
+    
+    return {
+        "status": "success",
+        "message": f"Synced {len(trades_to_sync)} trades, {updated_count} updated",
+        "updated": updated_count,
+        "updates": updates
+    }
+
+
+@router.post("/{trade_id}/refresh-status")
+async def refresh_trade_status(trade_id: int, db: Session = Depends(get_db)):
+    """Refresh status of a specific trade from broker"""
+    trade = db.query(Trade).filter(Trade.id == trade_id).first()
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    
+    if not trade.order_id:
+        raise HTTPException(status_code=400, detail="Trade has no broker order ID")
+    
+    if not broker_service.is_logged_in:
+        raise HTTPException(status_code=400, detail="Broker not logged in")
+    
+    # Get order status from broker
+    order_status = broker_service.get_order_status(trade.order_id)
+    
+    if order_status.get('status') != 'success':
+        raise HTTPException(status_code=500, detail=order_status.get('message', 'Failed to fetch order status'))
+    
+    old_status = trade.status
+    
+    # Update trade with broker data
+    trade.broker_status = order_status.get('broker_status')
+    trade.filled_quantity = order_status.get('filled_quantity')
+    trade.average_price = order_status.get('average_price')
+    trade.last_status_check = datetime.utcnow()
+    
+    # Update internal status
+    internal_status = order_status.get('internal_status')
+    if internal_status == 'EXECUTED':
+        trade.status = "EXECUTED"
+        trade.execution_price = order_status.get('average_price') or trade.entry_price
+    elif internal_status == 'REJECTED':
+        trade.status = "REJECTED"
+        trade.broker_rejection_reason = order_status.get('rejection_reason')
+        trade.error_message = order_status.get('rejection_reason')
+    elif internal_status == 'CANCELLED':
+        trade.status = "CANCELLED"
+    elif internal_status == 'OPEN':
+        trade.status = "OPEN"
+    
+    db.commit()
+    db.refresh(trade)
+    
+    # Notify via WebSocket
+    if ws_manager and old_status != trade.status:
+        await ws_manager.broadcast({
+            "type": "trade_status_update",
+            "data": {
+                "trade_id": trade.id,
+                "order_id": trade.order_id,
+                "old_status": old_status,
+                "new_status": trade.status,
+                "broker_status": trade.broker_status,
+                "rejection_reason": trade.broker_rejection_reason
+            }
+        })
+    
+    return trade
