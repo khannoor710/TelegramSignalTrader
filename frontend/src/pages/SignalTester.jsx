@@ -18,7 +18,9 @@ function SignalTester() {
     "TATASTEEL looking weak, sell below 145 for target 135, keep SL at 152",
     "INFY is bullish! Entry around 1800, book profit at 1850-1880",
     "NIFTY 23500 CE buy above 150, targets 180/200, strict SL 120",
-    "Accumulate HDFCBANK in 1650-1660 zone, SL 1620, TGT 1720"
+    "Accumulate HDFCBANK in 1650-1660 zone, SL 1620, TGT 1720",
+    "banknifty 53200 pe buy above 350 tgt 400 sl 290",
+    "nifty 24000 ce buy at 200 target 250 sl 180"
   ]
 
   useEffect(() => {

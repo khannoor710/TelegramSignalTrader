@@ -170,7 +170,7 @@ class RegexSignalParser:
     
     def __init__(self):
         self.patterns = {
-            'symbol': r'\b([A-Z][A-Z0-9]{1,15})\b',
+            'symbol': r'\b([A-Za-z][A-Za-z0-9]{1,15})\b',  # Case-insensitive symbol matching
             'buy': r'\b(?:BUY|buy|Buy|ABV|abv|Abv)\b',  # ABV (above) implies BUY
             'sell': r'\b(?:SELL|sell|Sell|BLW|blw|Blw)\b',  # BLW (below) implies SELL
             'price': r'(?:@|at|price|entry|above|below|abv|blw)\s*:?\s*(?:Rs\.?\s*)?(\d+(?:\.\d{1,2})?)',
