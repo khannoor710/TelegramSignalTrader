@@ -1,0 +1,60 @@
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.0.2, pluggy-1.6.0 -- C:\Program Files\Python311\python.exe
+cachedir: .pytest_cache
+rootdir: E:\Trading\Telegram\backend
+configfile: pytest.ini
+plugins: anyio-3.7.1, asyncio-1.3.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 3 items
+
+tests/test_api_refactor.py::test_config_endpoint ERROR                   [ 33%]
+tests/test_api_refactor.py::test_trades_crud ERROR                       [ 66%]
+tests/test_api_refactor.py::test_telegram_messages_crud ERROR            [100%]
+
+=================================== ERRORS ====================================
+___________________ ERROR at setup of test_config_endpoint ____________________
+C:\Users\khann\AppData\Roaming\Python\Python311\site-packages\pytest_asyncio\plugin.py:458: in setup
+    return super().setup()
+           ^^^^^^^^^^^^^^^
+C:\Users\khann\AppData\Roaming\Python\Python311\site-packages\pytest_asyncio\plugin.py:728: in pytest_fixture_setup
+    return (yield)
+            ^^^^^
+E   pytest.PytestRemovedIn9Warning: 'test_config_endpoint' requested an async fixture 'client', with no plugin or hook that handled it. This is usually an error, as pytest does not natively support it. This will turn into an error in pytest 9.
+E   See: https://docs.pytest.org/en/stable/deprecations.html#sync-test-depending-on-async-fixture
+_____________________ ERROR at setup of test_trades_crud ______________________
+C:\Users\khann\AppData\Roaming\Python\Python311\site-packages\pytest_asyncio\plugin.py:458: in setup
+    return super().setup()
+           ^^^^^^^^^^^^^^^
+C:\Users\khann\AppData\Roaming\Python\Python311\site-packages\pytest_asyncio\plugin.py:728: in pytest_fixture_setup
+    return (yield)
+            ^^^^^
+E   pytest.PytestRemovedIn9Warning: 'test_trades_crud' requested an async fixture 'client', with no plugin or hook that handled it. This is usually an error, as pytest does not natively support it. This will turn into an error in pytest 9.
+E   See: https://docs.pytest.org/en/stable/deprecations.html#sync-test-depending-on-async-fixture
+________________ ERROR at setup of test_telegram_messages_crud ________________
+C:\Users\khann\AppData\Roaming\Python\Python311\site-packages\pytest_asyncio\plugin.py:458: in setup
+    return super().setup()
+           ^^^^^^^^^^^^^^^
+C:\Users\khann\AppData\Roaming\Python\Python311\site-packages\pytest_asyncio\plugin.py:728: in pytest_fixture_setup
+    return (yield)
+            ^^^^^
+E   pytest.PytestRemovedIn9Warning: 'test_telegram_messages_crud' requested an async fixture 'client', with no plugin or hook that handled it. This is usually an error, as pytest does not natively support it. This will turn into an error in pytest 9.
+E   See: https://docs.pytest.org/en/stable/deprecations.html#sync-test-depending-on-async-fixture
+============================== warnings summary ===============================
+app\models\models.py:8
+  E:\Trading\Telegram\backend\app\models\models.py:8: MovedIn20Warning: The ``declarative_base()`` function is now available as sqlalchemy.orm.declarative_base(). (deprecated since: 2.0) (Background on SQLAlchemy 2.0 at: https://sqlalche.me/e/b8d9)
+    Base = declarative_base()
+
+C:\Users\khann\AppData\Roaming\Python\Python311\site-packages\pydantic\_internal\_config.py:268
+C:\Users\khann\AppData\Roaming\Python\Python311\site-packages\pydantic\_internal\_config.py:268
+C:\Users\khann\AppData\Roaming\Python\Python311\site-packages\pydantic\_internal\_config.py:268
+C:\Users\khann\AppData\Roaming\Python\Python311\site-packages\pydantic\_internal\_config.py:268
+C:\Users\khann\AppData\Roaming\Python\Python311\site-packages\pydantic\_internal\_config.py:268
+  C:\Users\khann\AppData\Roaming\Python\Python311\site-packages\pydantic\_internal\_config.py:268: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.5/migration/
+    warnings.warn(DEPRECATION_MESSAGE, DeprecationWarning)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+ERROR tests/test_api_refactor.py::test_config_endpoint - pytest.PytestRemoved...
+ERROR tests/test_api_refactor.py::test_trades_crud - pytest.PytestRemovedIn9W...
+ERROR tests/test_api_refactor.py::test_telegram_messages_crud - pytest.Pytest...
+======================== 6 warnings, 3 errors in 3.00s ========================

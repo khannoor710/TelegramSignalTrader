@@ -18,32 +18,32 @@ services:
     environment:
       # Database
       - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/trading_bot.db}
-      
+
       # Security
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-      
+
       # Telegram API
       - TELEGRAM_API_ID=${TELEGRAM_API_ID}
       - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
       - TELEGRAM_PHONE_NUMBER=${TELEGRAM_PHONE_NUMBER}
-      
+
       # Angel One Broker (optional)
       - ANGEL_ONE_API_KEY=${ANGEL_ONE_API_KEY:-}
       - ANGEL_ONE_CLIENT_ID=${ANGEL_ONE_CLIENT_ID:-}
       - ANGEL_ONE_PASSWORD=${ANGEL_ONE_PASSWORD:-}
       - ANGEL_ONE_TOTP_SECRET=${ANGEL_ONE_TOTP_SECRET:-}
-      
+
       # Application Settings
       - AUTO_TRADE_ENABLED=${AUTO_TRADE_ENABLED:-false}
       - REQUIRE_MANUAL_APPROVAL=${REQUIRE_MANUAL_APPROVAL:-true}
       - DEFAULT_QUANTITY=${DEFAULT_QUANTITY:-1}
       - MAX_TRADES_PER_DAY=${MAX_TRADES_PER_DAY:-10}
       - RISK_PERCENTAGE=${RISK_PERCENTAGE:-1.0}
-      
+
       # AI Signal Parsing (Gemini)
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
-      
+
       # Development settings
       - PYTHONUNBUFFERED=1
     volumes:
@@ -55,7 +55,7 @@ services:
       - ./sessions:/app/sessions
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ] # Internal port stays 8000
       interval: 30s
       timeout: 10s
       retries: 3
@@ -87,7 +87,7 @@ volumes:
   data:
   sessions:
 
-# ---- Networks ----
+    # ---- Networks ----
 networks:
   default:
     name: telegram-trading-network

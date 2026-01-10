@@ -38,6 +38,34 @@ def migrate():
         cursor.execute("SELECT active_broker_type FROM app_settings LIMIT 1")
     except sqlite3.OperationalError:
         migrations.append(("app_settings", "active_broker_type", "ALTER TABLE app_settings ADD COLUMN active_broker_type VARCHAR DEFAULT 'angel_one'"))
+        
+    # Check and add price_tolerance_percent
+    try:
+        cursor.execute("SELECT price_tolerance_percent FROM app_settings LIMIT 1")
+    except sqlite3.OperationalError:
+        migrations.append(("app_settings", "price_tolerance_percent", "ALTER TABLE app_settings ADD COLUMN price_tolerance_percent FLOAT DEFAULT 2.0"))
+
+    # Risk Management Columns
+    risk_columns = [
+        ("daily_loss_limit_enabled", "BOOLEAN DEFAULT 0"),
+        ("daily_loss_limit_percent", "FLOAT DEFAULT 5.0"),
+        ("daily_loss_limit_amount", "FLOAT"),
+        ("position_sizing_mode", "VARCHAR DEFAULT 'fixed'"),
+        ("max_position_value", "FLOAT"),
+        ("max_open_positions", "INTEGER DEFAULT 10"),
+        ("trading_start_time", "VARCHAR DEFAULT '09:15'"),
+        ("trading_end_time", "VARCHAR DEFAULT '15:15'"),
+        ("weekend_trading_disabled", "BOOLEAN DEFAULT 1"),
+        ("paper_trading_enabled", "BOOLEAN DEFAULT 1"),
+        ("paper_trading_balance", "FLOAT DEFAULT 100000.0")
+    ]
+    
+    for col, type_def in risk_columns:
+        try:
+            cursor.execute(f"SELECT {col} FROM app_settings LIMIT 1")
+        except sqlite3.OperationalError:
+            print(f"  - Identifying missing column: {col}")
+            migrations.append(("app_settings", col, f"ALTER TABLE app_settings ADD COLUMN {col} {type_def}"))
     
     # Execute migrations
     if migrations:

@@ -57,12 +57,13 @@ class TelegramMessageResponse(BaseModel):
 
 # Broker schemas
 class BrokerConfigBase(BaseModel):
-    broker_name: str = "angel_one"  # angel_one, zerodha, upstox, fyers
+    broker_name: str = "angel_one"  # angel_one, zerodha, upstox, fyers, shoonya
     api_key: str
-    api_secret: Optional[str] = None  # For Zerodha, Upstox
+    api_secret: Optional[str] = None  # For Zerodha, Upstox, Shoonya
     client_id: str
     pin: str  # Trading PIN or password
     totp_secret: Optional[str] = None  # For Angel One TOTP or Zerodha API secret
+    imei: Optional[str] = None  # For SHOONYA broker - device identifier
 
 
 class BrokerConfigCreate(BrokerConfigBase):

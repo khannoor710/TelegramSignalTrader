@@ -14,7 +14,9 @@ from app.schemas.schemas import (
     TelegramMessageResponse,
     TradeCreate
 )
-from app.models.models import TelegramConfig, TelegramMessage, Trade, AppSettings
+from app.models.models import TelegramConfig, AppSettings, Trade
+from app.repositories.message_repository import MessageRepository
+from app.repositories.trade_repository import TradeRepository
 from app.services.telegram_service import TelegramService
 from app.services.broker_service import broker_service, symbol_master
 from app.core.logging_config import get_logger
@@ -151,24 +153,15 @@ async def get_messages(
     db: Session = Depends(get_db)
 ):
     """Get Telegram messages"""
-    query = db.query(TelegramMessage)
-    
-    if unprocessed_only:
-        query = query.filter(TelegramMessage.is_processed.is_(False))
-    
-    messages = query.order_by(TelegramMessage.timestamp.desc()).offset(skip).limit(limit).all()
-    return messages
+    return MessageRepository.get_all(db, limit, skip, unprocessed_only)
 
 
 @router.post("/messages/{message_id}/process")
 async def mark_message_processed(message_id: int, db: Session = Depends(get_db)):
     """Mark message as processed"""
-    message = db.query(TelegramMessage).filter(TelegramMessage.id == message_id).first()
+    message = MessageRepository.mark_processed(db, message_id)
     if not message:
         raise HTTPException(status_code=404, detail="Message not found")
-    
-    message.is_processed = True
-    db.commit()
     
     return {"status": "success", "message": "Message marked as processed"}
 
@@ -206,14 +199,6 @@ async def fetch_historic_messages(
 ):
     """
     Fetch historic messages from a specific chat.
-    
-    Args:
-        chat_id: The chat ID to fetch messages from
-        limit: Maximum number of messages to fetch (default 100, max 500)
-        save_to_db: Whether to save fetched messages to database
-    
-    Returns:
-        List of messages or summary if saved to database
     """
     if not telegram_service:
         raise HTTPException(status_code=500, detail="Telegram service not available")
@@ -247,62 +232,19 @@ async def get_messages_by_chat(
     db: Session = Depends(get_db)
 ):
     """Get messages from a specific chat"""
-    query = db.query(TelegramMessage).filter(TelegramMessage.chat_id == chat_id)
-    
-    if signals_only:
-        query = query.filter(TelegramMessage.parsed_signal.isnot(None))
-    
-    messages = query.order_by(TelegramMessage.timestamp.desc()).offset(skip).limit(limit).all()
-    return messages
+    return MessageRepository.get_by_chat(db, chat_id, limit, skip, signals_only)
 
 
 @router.get("/messages/stats")
 async def get_message_stats(db: Session = Depends(get_db)):
     """Get message statistics"""
-    from sqlalchemy import func, case
-    
-    total = db.query(TelegramMessage).count()
-    with_signals = db.query(TelegramMessage).filter(TelegramMessage.parsed_signal.isnot(None)).count()
-    unprocessed = db.query(TelegramMessage).filter(
-        TelegramMessage.parsed_signal.isnot(None),
-        TelegramMessage.is_processed.is_(False)
-    ).count()
-    
-    # Get counts by chat
-    chat_stats = db.query(
-        TelegramMessage.chat_name,
-        TelegramMessage.chat_id,
-        func.count(TelegramMessage.id).label('message_count'),
-        func.sum(
-            case(
-                (TelegramMessage.parsed_signal.isnot(None), 1),
-                else_=0
-            )
-        ).label('signal_count')
-    ).group_by(TelegramMessage.chat_id, TelegramMessage.chat_name).all()
-    
-    return {
-        "total_messages": total,
-        "total_signals": with_signals,
-        "unprocessed_signals": unprocessed,
-        "chats": [
-            {
-                "chat_id": stat.chat_id,
-                "chat_name": stat.chat_name,
-                "message_count": stat.message_count,
-                "signal_count": stat.signal_count or 0
-            }
-            for stat in chat_stats
-        ]
-    }
+    return MessageRepository.get_stats(db)
 
 
 @router.delete("/messages")
 async def delete_all_messages(db: Session = Depends(get_db)):
     """Delete all stored messages (use with caution)"""
-    count = db.query(TelegramMessage).count()
-    db.query(TelegramMessage).delete()
-    db.commit()
+    count = MessageRepository.delete_all(db)
     return {"status": "success", "deleted": count}
 
 
@@ -314,15 +256,9 @@ async def execute_trade_from_message(
 ):
     """
     Execute a trade based on a Telegram message signal.
-    
-    This endpoint:
-    1. Validates the message exists and has a parsed signal
-    2. Creates a trade record
-    3. Optionally executes immediately based on settings
-    4. Marks the message as processed
     """
     # Get the message
-    message = db.query(TelegramMessage).filter(TelegramMessage.id == message_id).first()
+    message = MessageRepository.get_by_id(db, message_id)
     if not message:
         raise HTTPException(status_code=404, detail="Message not found")
     
@@ -351,10 +287,7 @@ async def execute_trade_from_message(
     # Check trade limits
     settings = db.query(AppSettings).first()
     if settings:
-        today = date.today()
-        today_trades = db.query(Trade).filter(
-            Trade.created_at >= datetime(today.year, today.month, today.day)
-        ).count()
+        today_trades = TradeRepository.count_todays_trades(db)
         
         if today_trades >= settings.max_trades_per_day:
             raise HTTPException(
@@ -370,38 +303,32 @@ async def execute_trade_from_message(
         quantity = 1
     
     # Create trade record
-    db_trade = Trade(
-        message_id=message_id,
-        symbol=trade_params.symbol.upper(),
-        action=trade_params.action.upper(),
-        quantity=quantity,
-        entry_price=trade_params.entry_price,
-        target_price=trade_params.target_price,
-        stop_loss=trade_params.stop_loss,
-        order_type=trade_params.order_type,
-        exchange=trade_params.exchange,
-        product_type=trade_params.product_type,
-        status="PENDING"
-    )
+    trade_data = {
+        "message_id": message_id,
+        "symbol": trade_params.symbol.upper(),
+        "action": trade_params.action.upper(),
+        "quantity": quantity,
+        "entry_price": trade_params.entry_price,
+        "target_price": trade_params.target_price,
+        "stop_loss": trade_params.stop_loss,
+        "order_type": trade_params.order_type,
+        "exchange": trade_params.exchange,
+        "product_type": trade_params.product_type,
+        "status": "PENDING"
+    }
     
     logger.info("\n📝 TRADE RECORD CREATED:")
-    logger.info(f"  Symbol: {db_trade.symbol}")
-    logger.info(f"  Action: {db_trade.action}")
-    logger.info(f"  Quantity: {db_trade.quantity}")
-    logger.info(f"  Order Type: {db_trade.order_type}")
-    logger.info(f"  Exchange: {db_trade.exchange}")
-    logger.info(f"  Product Type: {db_trade.product_type}")
+    logger.info(f"  Symbol: {trade_data['symbol']}")
+    logger.info(f"  Action: {trade_data['action']}")
+    logger.info(f"  Quantity: {trade_data['quantity']}")
     
-    db.add(db_trade)
-    db.commit()
-    db.refresh(db_trade)
+    db_trade = TradeRepository.create(db, trade_data)
     
     logger.info(f"  Trade ID: {db_trade.id}")
     logger.info(f"  Status: {db_trade.status}")
     
     # Mark message as processed
-    message.is_processed = True
-    db.commit()
+    MessageRepository.mark_processed(db, message_id)
     
     # Get active broker from registry instead of hardcoded broker_service
     from app.services.broker_registry import broker_registry
@@ -447,10 +374,10 @@ async def execute_trade_from_message(
         )
         
         if result['status'] == 'success':
-            db_trade.status = "EXECUTED"
-            db_trade.order_id = result['order_id']
-            db_trade.execution_time = datetime.utcnow()
-            db.commit()
+            TradeRepository.update_status(
+                db, db_trade.id, "EXECUTED", 
+                order_id=result['order_id']
+            )
             
             logger.info("\n✅ TRADE EXECUTED SUCCESSFULLY!")
             logger.info(f"  Order ID: {result['order_id']}")
@@ -473,9 +400,10 @@ async def execute_trade_from_message(
                 }
             }
         else:
-            db_trade.status = "FAILED"
-            db_trade.error_message = result['message']
-            db.commit()
+            TradeRepository.update_status(
+                db, db_trade.id, "FAILED", 
+                error_message=result['message']
+            )
             
             logger.error("\n❌ TRADE EXECUTION FAILED!")
             logger.error(f"  Error: {result['message']}")
@@ -520,10 +448,6 @@ async def execute_trade_from_message(
 async def test_signal_parsing(message_text: str, db: Session = Depends(get_db)):
     """
     Test endpoint to simulate receiving a Telegram message and parsing it.
-    Use this to verify the signal parser works before connecting to Telegram.
-    
-    Example usage:
-    curl -X POST "http://localhost:8000/api/telegram/test-signal?message_text=BUY%20RELIANCE%20@%202450%20Target%202500%20SL%202420"
     """
     from app.services.signal_parser import SignalParser
     
@@ -576,14 +500,6 @@ async def simulate_telegram_trade(
 ):
     """
     Full simulation: Parse message → Create trade → Optionally execute.
-    
-    This is the same flow that happens when a real Telegram message arrives.
-    
-    Args:
-        message_text: The message to parse (e.g., "BUY RELIANCE @ 2450 TGT 2500 SL 2420")
-        execute: If True and broker is logged in, will actually execute the trade!
-    
-    WARNING: If execute=True, this will place a REAL order!
     """
     from app.services.signal_parser import SignalParser
     
@@ -619,23 +535,21 @@ async def simulate_telegram_trade(
     quantity = parsed.get('quantity') or (settings.default_quantity if settings else 1)
     
     # Create trade record
-    db_trade = Trade(
-        symbol=parsed['symbol'].upper(),
-        action=parsed['action'].upper(),
-        quantity=quantity,
-        entry_price=parsed.get('entry_price'),
-        target_price=parsed.get('target_price'),
-        stop_loss=parsed.get('stop_loss'),
-        order_type='LIMIT' if parsed.get('entry_price') else 'MARKET',
-        exchange=exchange,
-        product_type='INTRADAY',
-        status='PENDING',
-        notes=f"Simulated from: {message_text[:100]}"
-    )
+    trade_data = {
+        "symbol": parsed['symbol'].upper(),
+        "action": parsed['action'].upper(),
+        "quantity": quantity,
+        "entry_price": parsed.get('entry_price'),
+        "target_price": parsed.get('target_price'),
+        "stop_loss": parsed.get('stop_loss'),
+        "order_type": 'LIMIT' if parsed.get('entry_price') else 'MARKET',
+        "exchange": exchange,
+        "product_type": 'INTRADAY',
+        "status": 'PENDING',
+        "notes": f"Simulated from: {message_text[:100]}"
+    }
     
-    db.add(db_trade)
-    db.commit()
-    db.refresh(db_trade)
+    db_trade = TradeRepository.create(db, trade_data)
     
     result = {
         "step": "create",
@@ -676,10 +590,10 @@ async def simulate_telegram_trade(
         )
         
         if order_result['status'] == 'success':
-            db_trade.status = 'EXECUTED'
-            db_trade.order_id = order_result['order_id']
-            db_trade.execution_time = datetime.utcnow()
-            db.commit()
+            TradeRepository.update_status(
+                db, db_trade.id, "EXECUTED", 
+                order_id=order_result['order_id']
+            )
             
             result["step"] = "execute"
             result["execute_status"] = "success"
@@ -687,9 +601,10 @@ async def simulate_telegram_trade(
             result["trade"]["status"] = "EXECUTED"
             result["trade"]["order_id"] = order_result['order_id']
         else:
-            db_trade.status = 'FAILED'
-            db_trade.error_message = order_result['message']
-            db.commit()
+            TradeRepository.update_status(
+                db, db_trade.id, "FAILED", 
+                error_message=order_result['message']
+            )
             
             result["step"] = "execute"
             result["execute_status"] = "failed"
@@ -702,7 +617,7 @@ async def simulate_telegram_trade(
 @router.get("/messages/{message_id}/signal")
 async def get_message_signal(message_id: int, db: Session = Depends(get_db)):
     """Get parsed signal details from a message for trade execution"""
-    message = db.query(TelegramMessage).filter(TelegramMessage.id == message_id).first()
+    message = MessageRepository.get_by_id(db, message_id)
     if not message:
         raise HTTPException(status_code=404, detail="Message not found")
     

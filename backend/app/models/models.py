@@ -73,10 +73,11 @@ class BrokerConfig(Base):
     id = Column(Integer, primary_key=True, index=True)
     broker_name = Column(String, default="angel_one", index=True)  # angel_one, zerodha, upstox, fyers
     api_key = Column(String)
-    api_secret = Column(String, nullable=True)  # For brokers like Zerodha that need API secret
+    api_secret = Column(String, nullable=True)  # For brokers like Zerodha/Shoonya API secret/app key
     client_id = Column(String)
     password_encrypted = Column(String)
     totp_secret = Column(String, nullable=True)  # For Angel One TOTP
+    imei = Column(String, nullable=True)  # For SHOONYA broker - unique device identifier
     is_active = Column(Boolean, default=False)
     last_login = Column(DateTime, nullable=True)
     # Session persistence fields

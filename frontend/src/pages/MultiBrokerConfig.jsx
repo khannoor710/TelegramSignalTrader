@@ -29,10 +29,12 @@ const BROKER_CONFIGS = {
     icon: '🌟',
     color: '#00a86b',
     fields: [
-      { key: 'api_key', label: 'Vendor Code', type: 'text', required: true, help: 'Vendor code from Shoonya' },
+      { key: 'api_key', label: 'Vendor Code', type: 'text', required: true, help: 'Vendor code from Shoonya API portal' },
+      { key: 'api_secret', label: 'API Key (App Key)', type: 'password', required: true, help: 'API Secret/App Key from Shoonya API portal' },
       { key: 'client_id', label: 'User ID', type: 'text', required: true, help: 'Your Shoonya user ID' },
       { key: 'pin', label: 'Password', type: 'password', required: true, help: 'Trading password' },
-      { key: 'totp_secret', label: 'TOTP', type: 'password', required: true, help: '6-digit OTP or TOTP secret' }
+      { key: 'totp_secret', label: 'TOTP/OTP', type: 'password', required: true, help: '6-digit OTP or TOTP secret' },
+      { key: 'imei', label: 'Device ID (IMEI)', type: 'text', required: false, help: 'Unique device identifier (optional, defaults to system value)' }
     ]
   }
 }
@@ -55,7 +57,7 @@ const formatPnL = (value) => {
 
 function MultiBrokerConfig({ brokerStatus: propBrokerStatus, onBrokerStatusChange }) {
   const [selectedBroker, setSelectedBroker] = useState('angel_one')
-  const [config, setConfig] = useState({ broker_name: 'angel_one', api_key: '', api_secret: '', client_id: '', pin: '', totp_secret: '' })
+  const [config, setConfig] = useState({ broker_name: 'angel_one', api_key: '', api_secret: '', client_id: '', pin: '', totp_secret: '', imei: '' })
   const [availableBrokers, setAvailableBrokers] = useState([])
   const [configuredBrokers, setConfiguredBrokers] = useState([])
   const [activeBroker, setActiveBroker] = useState(null)
@@ -183,7 +185,7 @@ function MultiBrokerConfig({ brokerStatus: propBrokerStatus, onBrokerStatusChang
       await api.post('/broker/config', config)
       showMessage('success', `${BROKER_CONFIGS[selectedBroker]?.name || selectedBroker} configuration saved!`)
       fetchConfiguredBrokers()
-      setConfig({ broker_name: selectedBroker, api_key: '', api_secret: '', client_id: '', pin: '', totp_secret: '' })
+      setConfig({ broker_name: selectedBroker, api_key: '', api_secret: '', client_id: '', pin: '', totp_secret: '', imei: '' })
     } catch (e) {
       showMessage('error', e.response?.data?.detail || e.message)
     }

@@ -5,7 +5,30 @@ Implements BrokerInterface for Shoonya's API.
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 import logging
-import hashlib
+
+# SSL/WebSocket workaround for Shoonya connections
+# This fixes SSL certificate verification issues that can occur with WebSocket connections
+try:
+    import websocket
+    import ssl
+    
+    # Save original WebSocketApp __init__
+    _original_ws_init = websocket.WebSocketApp.__init__
+    
+    def _patched_ws_init(self, *args, **kwargs):
+        """Patched WebSocketApp init that bypasses SSL verification"""
+        if 'sslopt' not in kwargs:
+            kwargs['sslopt'] = {}
+        kwargs['sslopt']['cert_reqs'] = ssl.CERT_NONE
+        return _original_ws_init(self, *args, **kwargs)
+    
+    # Apply the patch
+    websocket.WebSocketApp.__init__ = _patched_ws_init
+    logger = logging.getLogger(__name__)
+    logger.info("✅ Applied SSL workaround for Shoonya WebSocket connections")
+except Exception as e:
+    logger = logging.getLogger(__name__)
+    logger.warning(f"⚠️ Could not apply SSL workaround: {e}")
 
 try:
     from NorenRestApiPy.NorenApi import NorenApi
@@ -50,7 +73,9 @@ class ShoonyaBrokerService(BrokerInterface):
         api_key: str, 
         client_id: str, 
         password: str, 
-        totp_secret: Optional[str] = None
+        totp_secret: Optional[str] = None,
+        api_secret: Optional[str] = None,
+        imei: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Login to Shoonya account.
@@ -60,6 +85,8 @@ class ShoonyaBrokerService(BrokerInterface):
             client_id: User ID
             password: Trading password
             totp_secret: TOTP token (6-digit OTP) or TOTP secret for auto-generation
+            api_secret: API Secret/App Key from Shoonya (optional, defaults to client_id)
+            imei: Unique device identifier (optional, defaults to 'default_device_001')
             
         Returns:
             Dict with login status
@@ -80,28 +107,46 @@ class ShoonyaBrokerService(BrokerInterface):
             
             # Generate TOTP if secret provided
             totp_token = totp_secret
-            if totp_secret and len(totp_secret) > 10:
-                # Assume it's TOTP secret, generate token
-                try:
-                    import pyotp
-                    totp = pyotp.TOTP(totp_secret)
-                    totp_token = totp.now()
-                except Exception as e:
-                    logger.warning(f"TOTP generation failed: {e}")
+            if totp_secret:
+                # Check if it's a 6-digit code (manual entry) or TOTP secret (base32)
+                if len(totp_secret) == 6 and totp_secret.isdigit():
+                    # It's already a 6-digit TOTP code - use directly
+                    totp_token = totp_secret
+                    logger.debug(f"Using manually provided TOTP code")
+                elif len(totp_secret) > 10:
+                    # Assume it's TOTP secret, generate token
+                    try:
+                        import pyotp
+                        totp = pyotp.TOTP(totp_secret)
+                        totp_token = totp.now()
+                        logger.info(f"Generated TOTP token from secret")
+                    except Exception as e:
+                        logger.warning(f"TOTP generation failed: {e}")
+                        totp_token = totp_secret
+                else:
+                    # Unknown format, use as-is
+                    logger.debug(f"Using TOTP value as-is")
                     totp_token = totp_secret
             
-            # Generate password hash
-            pwd_hash = hashlib.sha256(password.encode()).hexdigest()
+            # NOTE: NorenRestApiPy library handles password SHA256 hashing internally
+            # Do NOT hash the password here - pass it as plaintext
             
-            # Login to Shoonya
+            # Set default IMEI if not provided (numeric string format)
+            imei_value = imei if imei else '123456789012345'
+            
+            logger.info(f"Shoonya login attempt for user: {client_id}")
+            
+            # Login to Shoonya - library handles password hashing
             result = self._api.login(
                 userid=client_id,
-                password=pwd_hash,
+                password=password,  # Pass plaintext password - library will hash it
                 twoFA=totp_token if totp_token else '',
                 vendor_code=api_key,
-                api_secret=client_id,  # Shoonya uses userid as api_secret
-                imei='abc1234'
+                api_secret=api_secret if api_secret else client_id,
+                imei=imei_value
             )
+            
+            logger.debug(f"Shoonya API response: {result}")
             
             if result and result.get('stat') == 'Ok':
                 self._is_logged_in = True
@@ -111,10 +156,19 @@ class ShoonyaBrokerService(BrokerInterface):
                     "session_token": result.get('susertoken', '')
                 }
             else:
-                error_msg = result.get('emsg', 'Login failed') if result else 'Login failed'
+                # Get detailed error message from API response
+                error_msg = 'Login failed'
+                if result:
+                    error_msg = result.get('emsg', result.get('message', 'Login failed'))
+                    # Log the full result for debugging
+                    logger.error(f"🔴 Shoonya login failed. Full API response: {result}")
+                else:
+                    logger.error(f"🔴 Shoonya login failed: API returned None/empty response")
+                
                 return {
                     "status": "error",
-                    "message": f"Login failed: {error_msg}"
+                    "message": f"Login failed: {error_msg}",
+                    "api_response": result  # Include full response for debugging
                 }
         
         except Exception as e:

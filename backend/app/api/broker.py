@@ -105,6 +105,7 @@ async def create_broker_config(config: BrokerConfigCreate, db: Session = Depends
         existing.client_id = config.client_id
         existing.password_encrypted = encrypted_pin
         existing.totp_secret = encrypted_totp
+        existing.imei = config.imei if hasattr(config, 'imei') else None
         db_config = existing
     else:
         # Create new config
@@ -115,6 +116,7 @@ async def create_broker_config(config: BrokerConfigCreate, db: Session = Depends
             client_id=config.client_id,
             password_encrypted=encrypted_pin,
             totp_secret=encrypted_totp,
+            imei=config.imei if hasattr(config, 'imei') else None,
             is_active=False
         )
         db.add(db_config)
@@ -555,29 +557,39 @@ async def set_active_broker(
     db: Session = Depends(get_db)
 ):
     """Set the active broker for trading"""
-    # Validate broker type
-    if not broker_registry.is_registered(broker_type):
-        available = broker_registry.list_available_brokers()
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid broker type. Available: {available}"
-        )
-    
-    # Update settings
-    settings = db.query(AppSettings).first()
-    if not settings:
-        settings = AppSettings(active_broker_type=broker_type)
-        db.add(settings)
-    else:
-        settings.active_broker_type = broker_type
-    
-    db.commit()
-    
-    return {
-        "status": "success",
-        "message": f"Active broker set to {broker_type}",
-        "broker_type": broker_type
-    }
+    try:
+        # Validate broker type
+        if not broker_registry.is_registered(broker_type):
+            available = broker_registry.list_available_brokers()
+            print(f"❌ Invalid broker type: {broker_type}. Available: {available}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid broker type. Available: {available}"
+            )
+        
+        # Update settings
+        settings = db.query(AppSettings).first()
+        if not settings:
+            settings = AppSettings(active_broker_type=broker_type)
+            db.add(settings)
+        else:
+            settings.active_broker_type = broker_type
+        
+        db.commit()
+        
+        return {
+            "status": "success",
+            "message": f"Active broker set to {broker_type}",
+            "broker_type": broker_type
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"❌ Error setting active broker: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 
 @router.get("/brokers/{broker_type}/status")
@@ -656,12 +668,22 @@ async def login_specific_broker(broker_type: str, db: Session = Depends(get_db))
             result['needs_oauth'] = True
     else:
         # Standard login flow (Angel One, Shoonya, etc.)
-        result = broker.login(
-            api_key=config.api_key,
-            client_id=config.client_id,
-            password=decrypted_pin,
-            totp_secret=decrypted_totp_secret
-        )
+        # For SHOONYA, also pass api_secret and imei
+        login_params = {
+            'api_key': config.api_key,
+            'client_id': config.client_id,
+            'password': decrypted_pin,
+            'totp_secret': decrypted_totp_secret
+        }
+        
+        # Add SHOONYA-specific parameters if broker is shoonya
+        if broker_type == "shoonya":
+            if decrypted_api_secret:
+                login_params['api_secret'] = decrypted_api_secret
+            if config.imei:
+                login_params['imei'] = config.imei
+        
+        result = broker.login(**login_params)
     
     if result['status'] == 'success':
         # Clear broker cache on successful login
