@@ -19,6 +19,9 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
+coverage.xml
+*.cover
 
 # Virtual Environment
 venv/
@@ -44,7 +47,8 @@ env/
 
 # Logs
 *.log
-logs/
+logs/*
+!logs/.gitkeep
 
 # OS
 .DS_Store
@@ -74,6 +78,16 @@ backend/data/
 backend/trading_bot.db
 backend/.env
 backend/.env.*
+
 # Frontend env
 frontend/.env
 frontend/.env.*
+
+# Temporary and backup files
+*.tmp
+*.bak
+*.old
+output.txt
+
+# Docker volumes
+volumes/
