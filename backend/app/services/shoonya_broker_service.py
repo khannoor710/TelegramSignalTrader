@@ -497,15 +497,17 @@ class ShoonyaBrokerService(BrokerInterface):
         symbol: str,
         action: str,
         quantity: int,
-        price: float,
-        target: float,
-        stoploss: float,
-        exchange: str = "NSE"
+        entry_price: float,
+        target_price: float,
+        stop_loss: float,
+        exchange: str = "NSE",
+        product_type: str = "INTRADAY",
+        trailing_sl: float = None
     ) -> Dict[str, Any]:
         """
-        Place a bracket order.
+        Place a bracket order on Shoonya.
         
-        Note: Shoonya supports bracket orders through place_order with book_profit and book_loss.
+        Shoonya supports bracket orders through place_order with book_profit and book_loss.
         """
         if not self.is_logged_in:
             return {"status": "error", "message": "Not logged in"}
@@ -515,7 +517,7 @@ class ShoonyaBrokerService(BrokerInterface):
             if "-" not in symbol:
                 symbol = f"{symbol}-EQ"
             
-            transaction_type = "B" if action == "BUY" else "S"
+            transaction_type = "B" if action.upper() == "BUY" else "S"
             
             result = self._api.place_order(
                 buy_or_sell=transaction_type,
@@ -525,18 +527,21 @@ class ShoonyaBrokerService(BrokerInterface):
                 quantity=quantity,
                 discloseqty=0,
                 price_type="LMT",
-                price=price,
+                price=entry_price,
                 trigger_price=None,
                 retention='DAY',
-                book_loss_price=stoploss,
-                book_profit_price=target
+                book_loss_price=stop_loss,
+                book_profit_price=target_price
             )
             
             if result and result.get('stat') == 'Ok':
                 return {
                     "status": "success",
                     "order_id": result.get('norenordno'),
-                    "message": "Bracket order placed successfully"
+                    "message": "Bracket order placed successfully",
+                    "entry_price": entry_price,
+                    "target_price": target_price,
+                    "stop_loss": stop_loss
                 }
             else:
                 error_msg = result.get('emsg', 'BO failed') if result else 'BO failed'
@@ -545,6 +550,74 @@ class ShoonyaBrokerService(BrokerInterface):
         except Exception as e:
             logger.error(f"Bracket order failed: {str(e)}")
             return {"status": "error", "message": str(e)}
+    
+    def place_gtt_order(
+        self,
+        symbol: str,
+        action: str,
+        quantity: int,
+        trigger_price: float,
+        price: float,
+        exchange: str = "NSE",
+        order_type: str = "LIMIT"
+    ) -> Dict[str, Any]:
+        """
+        Place a GTT (Good Till Triggered) order on Shoonya.
+        
+        Note: Shoonya's GTT functionality may be limited. Check API documentation.
+        """
+        if not self.is_logged_in:
+            return {"status": "error", "message": "Not logged in"}
+        
+        # Shoonya may not have native GTT support - return not supported
+        return {
+            "status": "error",
+            "message": "GTT orders are not currently supported on Shoonya. Use bracket orders instead."
+        }
+    
+    def get_all_order_statuses(self) -> Dict[str, Any]:
+        """Get all orders with their statuses."""
+        if not self.is_logged_in:
+            return {"status": "error", "message": "Not logged in", "orders": []}
+        
+        try:
+            result = self._api.get_order_book()
+            
+            if not result or not isinstance(result, list):
+                return {"status": "success", "orders": []}
+            
+            order_list = []
+            for order in result:
+                status = order.get("status", "").lower()
+                
+                # Map Shoonya statuses to internal statuses
+                if status in ["complete", "fill"]:
+                    internal_status = "EXECUTED"
+                elif status == "rejected":
+                    internal_status = "REJECTED"
+                elif status in ["cancelled", "cancel"]:
+                    internal_status = "CANCELLED"
+                elif status in ["open", "pending", "trigger_pending"]:
+                    internal_status = "OPEN"
+                else:
+                    internal_status = "PENDING"
+                
+                order_list.append({
+                    "order_id": order.get("norenordno"),
+                    "broker_status": status,
+                    "internal_status": internal_status,
+                    "symbol": order.get("tsym"),
+                    "quantity": int(order.get("qty", 0)),
+                    "filled_quantity": int(order.get("fillshares", 0)),
+                    "average_price": float(order.get("avgprc", 0) or 0),
+                    "rejection_reason": order.get("rejreason") if status == "rejected" else None
+                })
+            
+            return {"status": "success", "orders": order_list}
+            
+        except Exception as e:
+            logger.error(f"Get all order statuses failed: {str(e)}")
+            return {"status": "error", "message": str(e), "orders": []}
     
     def get_profile(self) -> Dict[str, Any]:
         """Get user profile information."""

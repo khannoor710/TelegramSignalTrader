@@ -76,9 +76,14 @@ async def create_trade(trade: TradeCreate, db: Session = Depends(get_db)):
     
     if resolution_result.get("success") and resolution_result.get("resolved_symbol"):
         resolved_symbol = resolution_result["resolved_symbol"]
+        resolved_exchange = resolution_result.get("exchange", trade.exchange)  # Use resolved exchange if available
         if resolved_symbol != original_symbol:
             notes = f"Symbol resolved: {original_symbol} → {resolved_symbol}"
+            if resolved_exchange != trade.exchange:
+                notes += f" (exchange: {resolved_exchange})"
             logger.info(f"🔍 {notes}")
+    else:
+        resolved_exchange = trade.exchange
     
     db_trade = Trade(
         message_id=trade.message_id,
@@ -89,7 +94,7 @@ async def create_trade(trade: TradeCreate, db: Session = Depends(get_db)):
         target_price=trade.target_price,
         stop_loss=trade.stop_loss,
         order_type=trade.order_type,
-        exchange=trade.exchange,
+        exchange=resolved_exchange,  # Use resolved exchange (BFO for SENSEX, etc.)
         product_type=trade.product_type,
         status="PENDING",
         notes=notes  # Store resolution info
@@ -257,23 +262,27 @@ async def execute_trade_internal(trade_id: int, db: Session):
     
     if resolution_result.get("success"):
         resolved_symbol = resolution_result["resolved_symbol"]
-        logger.info(f"🔍 Symbol resolved: {original_symbol} → {resolved_symbol}")
+        resolved_exchange = resolution_result.get("exchange", trade.exchange)  # Get resolved exchange
+        logger.info(f"🔍 Symbol resolved: {original_symbol} → {resolved_symbol} (exchange: {resolved_exchange})")
         
-        # Update trade with resolved symbol if different
+        # Update trade with resolved symbol and exchange if different
         if resolved_symbol != original_symbol:
             trade.notes = f"Symbol resolved: {original_symbol} → {resolved_symbol}"
             trade.symbol = resolved_symbol
-            db.flush()  # Update in session
+        if resolved_exchange != trade.exchange:
+            trade.notes = (trade.notes or "") + f" (exchange: {trade.exchange} → {resolved_exchange})"
+            trade.exchange = resolved_exchange  # CRITICAL: Update exchange for BFO/BSE options
+        db.flush()  # Update in session
     else:
         logger.warning(f"⚠️ Symbol resolution warning: {resolution_result.get('message')}")
         # Continue with original symbol, but log the warning
     
-    # Place order with resolved symbol
+    # Place order with resolved symbol AND exchange
     result = broker_service.place_order(
         symbol=trade.symbol,
         action=trade.action,
         quantity=trade.quantity,
-        exchange=trade.exchange,
+        exchange=trade.exchange,  # Now uses BFO for SENSEX, etc.
         order_type=trade.order_type,
         product_type=trade.product_type,
         price=trade.entry_price
@@ -335,6 +344,94 @@ async def execute_trade_internal(trade_id: int, db: Session):
 async def execute_trade(trade_id: int, db: Session = Depends(get_db)):
     """Manually execute a trade"""
     return await execute_trade_internal(trade_id, db)
+
+
+@router.post("/{trade_id}/execute-bracket")
+async def execute_bracket_order(
+    trade_id: int,
+    trailing_sl: float = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Execute a trade as a bracket order with entry, target, and stop-loss.
+    
+    Bracket orders:
+    - Entry order at the trade's entry_price
+    - Target order at target_price (profit booking)
+    - Stop-loss order at stop_loss price
+    
+    Args:
+        trade_id: ID of the trade to execute
+        trailing_sl: Optional trailing stop-loss in points
+    
+    Note: Requires entry_price, target_price, and stop_loss to be set on the trade.
+    """
+    trade = db.query(Trade).filter(Trade.id == trade_id).first()
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    
+    # Validate required fields for bracket order
+    if not trade.entry_price:
+        raise HTTPException(status_code=400, detail="Entry price is required for bracket orders")
+    if not trade.target_price:
+        raise HTTPException(status_code=400, detail="Target price is required for bracket orders")
+    if not trade.stop_loss:
+        raise HTTPException(status_code=400, detail="Stop loss is required for bracket orders")
+    
+    if not broker_service.is_logged_in:
+        trade.status = "FAILED"
+        trade.error_message = "Broker not logged in"
+        db.commit()
+        raise HTTPException(status_code=400, detail="Broker not logged in")
+    
+    # Place bracket order
+    result = broker_service.place_bracket_order(
+        symbol=trade.symbol,
+        action=trade.action,
+        quantity=trade.quantity,
+        entry_price=trade.entry_price,
+        target_price=trade.target_price,
+        stop_loss=trade.stop_loss,
+        exchange=trade.exchange,
+        product_type=trade.product_type,
+        trailing_sl=trailing_sl
+    )
+    
+    if result.get('status') == 'success':
+        trade.order_id = result.get('order_id')
+        trade.status = "SUBMITTED"
+        trade.order_variety = "BRACKET"  # Track that this is a bracket order
+        trade.execution_time = datetime.utcnow()
+        trade.notes = f"Bracket order: Entry={trade.entry_price}, Target={trade.target_price}, SL={trade.stop_loss}"
+        
+        if ws_manager:
+            await ws_manager.broadcast({
+                "type": "bracket_order_placed",
+                "data": {
+                    "trade_id": trade.id,
+                    "order_id": result.get('order_id'),
+                    "entry_price": trade.entry_price,
+                    "target_price": trade.target_price,
+                    "stop_loss": trade.stop_loss
+                }
+            })
+    else:
+        trade.status = "FAILED"
+        trade.error_message = result.get('message', 'Bracket order failed')
+    
+    db.commit()
+    db.refresh(trade)
+    
+    return {
+        "trade_id": trade.id,
+        "status": trade.status,
+        "order_id": trade.order_id,
+        "order_variety": "BRACKET",
+        "message": result.get('message'),
+        "entry_price": trade.entry_price,
+        "target_price": trade.target_price,
+        "stop_loss": trade.stop_loss
+    }
 
 
 @router.get("/stats/summary")

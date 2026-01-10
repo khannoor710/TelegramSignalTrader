@@ -58,6 +58,12 @@ class Trade(Base):
     # Additional info
     notes = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
+    
+    # Advanced order tracking
+    order_variety = Column(String, default="NORMAL")  # NORMAL, BRACKET, GTT
+    parent_order_id = Column(String, nullable=True)  # For linked orders (bracket legs)
+    target_order_id = Column(String, nullable=True)  # Target/profit booking order ID
+    sl_order_id = Column(String, nullable=True)  # Stop-loss order ID
 
 
 class BrokerConfig(Base):
@@ -110,6 +116,18 @@ class AppSettings(Base):
     paper_trading_balance = Column(Float, default=100000.0)  # Virtual starting balance
     active_broker_type = Column(String, default="angel_one")  # Currently active broker
     price_tolerance_percent = Column(Float, default=2.0)  # Max % deviation from signal price for auto-trade
+    
+    # Risk Management Settings
+    daily_loss_limit_enabled = Column(Boolean, default=False)  # Enable daily loss limit
+    daily_loss_limit_percent = Column(Float, default=5.0)  # Stop trading at X% loss
+    daily_loss_limit_amount = Column(Float, nullable=True)  # Or stop at fixed amount loss
+    position_sizing_mode = Column(String, default="fixed")  # fixed, percent, risk_based
+    max_position_value = Column(Float, nullable=True)  # Maximum value per position
+    max_open_positions = Column(Integer, default=10)  # Maximum concurrent positions
+    trading_start_time = Column(String, default="09:15")  # Market open time
+    trading_end_time = Column(String, default="15:15")  # Stop new trades 15 min before close
+    weekend_trading_disabled = Column(Boolean, default=True)  # No trading on weekends
+    
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

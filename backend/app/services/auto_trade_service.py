@@ -44,6 +44,103 @@ class AutoTradeService:
             self._broker_registry = get_broker_registry()
         return self._broker_registry
     
+    def _check_risk_limits(self, settings: AppSettings, db: Session) -> Dict[str, Any]:
+        """
+        Check if trading is allowed based on risk management settings.
+        
+        Validates:
+        - Trading hours (market open/close)
+        - Weekend trading restrictions
+        - Daily loss limits
+        - Maximum open positions
+        
+        Returns:
+            Dict with 'allowed' boolean and 'reason' if not allowed
+        """
+        from datetime import datetime, time as dt_time
+        
+        now = datetime.now()
+        
+        # Check weekend trading
+        if getattr(settings, 'weekend_trading_disabled', True):
+            if now.weekday() >= 5:  # Saturday = 5, Sunday = 6
+                return {
+                    "allowed": False,
+                    "reason": "Weekend trading is disabled"
+                }
+        
+        # Check trading hours
+        trading_start = getattr(settings, 'trading_start_time', '09:15')
+        trading_end = getattr(settings, 'trading_end_time', '15:15')
+        
+        try:
+            start_hour, start_min = map(int, trading_start.split(':'))
+            end_hour, end_min = map(int, trading_end.split(':'))
+            
+            start_time = dt_time(start_hour, start_min)
+            end_time = dt_time(end_hour, end_min)
+            current_time = now.time()
+            
+            if current_time < start_time:
+                return {
+                    "allowed": False,
+                    "reason": f"Market not open yet. Trading starts at {trading_start}"
+                }
+            
+            if current_time > end_time:
+                return {
+                    "allowed": False,
+                    "reason": f"Trading hours ended at {trading_end}"
+                }
+        except (ValueError, AttributeError):
+            # If time parsing fails, allow trading
+            logger.warning("Could not parse trading hours, allowing trade")
+        
+        # Check daily loss limit
+        if getattr(settings, 'daily_loss_limit_enabled', False):
+            today = date.today()
+            today_start = datetime(today.year, today.month, today.day)
+            
+            # Calculate today's realized P&L from closed trades
+            from sqlalchemy import func
+            
+            today_pnl = db.query(
+                func.sum(
+                    (Trade.execution_price - Trade.entry_price) * Trade.quantity
+                )
+            ).filter(
+                Trade.created_at >= today_start,
+                Trade.status == 'EXECUTED'
+            ).scalar() or 0
+            
+            # Get loss limit (percent or fixed amount)
+            loss_limit_percent = getattr(settings, 'daily_loss_limit_percent', 5.0)
+            loss_limit_amount = getattr(settings, 'daily_loss_limit_amount', None)
+            
+            # If we have a fixed amount limit, use it
+            if loss_limit_amount and today_pnl < 0 and abs(today_pnl) >= loss_limit_amount:
+                return {
+                    "allowed": False,
+                    "reason": f"Daily loss limit reached (₹{abs(today_pnl):.2f} / ₹{loss_limit_amount:.2f})"
+                }
+            
+            # Note: Percent-based limit would need account balance to calculate
+            # For now, we use the fixed amount if available
+        
+        # Check max open positions
+        max_positions = getattr(settings, 'max_open_positions', 10)
+        open_positions = db.query(Trade).filter(
+            Trade.status.in_(['OPEN', 'SUBMITTED', 'PENDING'])
+        ).count()
+        
+        if open_positions >= max_positions:
+            return {
+                "allowed": False,
+                "reason": f"Maximum open positions ({max_positions}) reached"
+            }
+        
+        return {"allowed": True}
+    
     async def process_signal(
         self,
         parsed_signal: Dict[str, Any],
@@ -108,6 +205,13 @@ class AutoTradeService:
             if today_trades >= settings.max_trades_per_day:
                 result["reason"] = f"Daily trade limit ({settings.max_trades_per_day}) reached"
                 logger.warning(f"⚠️ Daily trade limit reached: {today_trades}/{settings.max_trades_per_day}")
+                return result
+            
+            # Step 1.5: Risk Management Checks
+            risk_check = self._check_risk_limits(settings, db)
+            if not risk_check["allowed"]:
+                result["reason"] = risk_check["reason"]
+                logger.warning(f"⚠️ Risk check failed: {risk_check['reason']}")
                 return result
             
             result["auto_trade_attempted"] = True

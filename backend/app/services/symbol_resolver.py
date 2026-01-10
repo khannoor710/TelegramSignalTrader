@@ -67,14 +67,15 @@ class SymbolResolver:
         "ITC": ["ITC LTD"],
     }
     
-    # Index options
+    # Index options with their exchanges
+    # NSE indices trade on NFO, BSE indices trade on BFO
     INDEX_OPTIONS = {
-        "NIFTY": "NIFTY",
-        "BANKNIFTY": "BANKNIFTY",
-        "FINNIFTY": "FINNIFTY",
-        "MIDCPNIFTY": "MIDCPNIFTY",
-        "SENSEX": "SENSEX",
-        "BANKEX": "BANKEX",
+        "NIFTY": {"symbol": "NIFTY", "exchange": "NFO"},
+        "BANKNIFTY": {"symbol": "BANKNIFTY", "exchange": "NFO"},
+        "FINNIFTY": {"symbol": "FINNIFTY", "exchange": "NFO"},
+        "MIDCPNIFTY": {"symbol": "MIDCPNIFTY", "exchange": "NFO"},
+        "SENSEX": {"symbol": "SENSEX", "exchange": "BFO"},
+        "BANKEX": {"symbol": "BANKEX", "exchange": "BFO"},
     }
     
     # Month codes for F&O
@@ -145,6 +146,7 @@ class SymbolResolver:
         - "NIFTY FUT" → {index: "NIFTY", is_future: True}
         """
         # Pattern for options: SYMBOL STRIKE CE/PE [EXPIRY]
+        # Supports: "NIFTY 25000 CE", "SENSEX 85500CE", "BANKNIFTY52000PE"
         option_pattern = r'^(\w+)\s*(\d+(?:\.\d+)?)\s*(CE|PE|CALL|PUT)(?:\s+(\w+))?$'
         # Pattern for futures: SYMBOL FUT [EXPIRY]
         future_pattern = r'^(\w+)\s+FUT(?:URE)?(?:\s+(\w+))?$'
@@ -169,7 +171,8 @@ class SymbolResolver:
                 "option_type": option_type,
                 "expiry_hint": expiry,
                 "is_option": True,
-                "is_index": symbol in self.INDEX_OPTIONS
+                "is_index": symbol in self.INDEX_OPTIONS,
+                "exchange": self.INDEX_OPTIONS.get(symbol, {}).get("exchange", "NFO") if symbol in self.INDEX_OPTIONS else "NFO"
             }
         
         # Try future pattern
@@ -190,6 +193,8 @@ class SymbolResolver:
     def _resolve_fno_symbol(self, fno_info: Dict, original: str) -> Dict[str, Any]:
         """Resolve F&O symbol to correct format"""
         symbol = fno_info["symbol"]
+        # Get exchange from fno_info (BFO for SENSEX/BANKEX, NFO for others)
+        target_exchange = fno_info.get("exchange", "NFO")
         
         if fno_info.get("is_option"):
             strike = fno_info["strike"]
@@ -201,10 +206,10 @@ class SymbolResolver:
             # Try to find matching option from symbol master
             if self.symbol_master:
                 # Search for options matching symbol, strike, and option type
-                search_results = self._search_fno_options(symbol, strike_str, option_type, fno_info.get("expiry_hint"))
+                search_results = self._search_fno_options(symbol, strike_str, option_type, fno_info.get("expiry_hint"), target_exchange)
                 if search_results:
                     best = search_results[0]
-                    logger.info(f"✅ Found F&O match: {original} → {best['symbol']} (token: {best['token']})")
+                    logger.info(f"✅ Found F&O match: {original} → {best['symbol']} (token: {best['token']}, exchange: {best['exchange']})")
                     return {
                         "success": True,
                         "original": original,
@@ -218,12 +223,12 @@ class SymbolResolver:
             # Fallback: construct symbol with weekly expiry format (DDMON2Y)
             expiry = self._get_weekly_expiry_string(fno_info.get("expiry_hint"))
             resolved = f"{symbol}{expiry}{strike_str}{option_type}"
-            exchange = "NFO"
+            exchange = target_exchange  # Use BFO for SENSEX/BANKEX
             
         else:  # Future
             expiry = self._get_monthly_expiry_string(fno_info.get("expiry_hint"))
             resolved = f"{symbol}{expiry}FUT"
-            exchange = "NFO"
+            exchange = target_exchange  # Use BFO for SENSEX/BANKEX
             
             if self.symbol_master:
                 token = self.symbol_master.get_token(resolved, exchange)
@@ -256,19 +261,23 @@ class SymbolResolver:
         symbol: str, 
         strike: str, 
         option_type: str, 
-        expiry_hint: str = None
+        expiry_hint: str = None,
+        exchange: str = "NFO"
     ) -> List[Dict]:
-        """Search for F&O options matching criteria"""
+        """Search for F&O options matching criteria on specified exchange"""
         if not self.symbol_master:
             return []
         
         # Search pattern: symbol + strike + option_type
         search_query = f"{symbol}{strike}{option_type}"
-        results = self.symbol_master.search_symbol(search_query, "NFO", limit=20)
+        logger.info(f"🔍 Searching F&O: {search_query} on {exchange}")
+        
+        results = self.symbol_master.search_symbol(search_query, exchange, limit=20)
         
         if not results:
             # Try searching just with symbol
-            results = self.symbol_master.search_symbol(symbol, "NFO", limit=50)
+            logger.info(f"🔍 Fallback search: {symbol} on {exchange}")
+            results = self.symbol_master.search_symbol(symbol, exchange, limit=50)
         
         # Filter and sort results
         matching = []
@@ -283,6 +292,8 @@ class SymbolResolver:
         
         # Sort by symbol (nearest expiry first - they're usually sorted alphabetically by date)
         matching.sort(key=lambda x: x.get("symbol", ""))
+        
+        logger.info(f"🔍 Found {len(matching)} matching options for {symbol}{strike}{option_type} on {exchange}")
         
         # Filter by expiry hint if provided
         if expiry_hint and matching:

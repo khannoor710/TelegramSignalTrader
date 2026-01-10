@@ -480,21 +480,127 @@ class ZerodhaBrokerService(BrokerInterface):
         symbol: str,
         action: str,
         quantity: int,
-        price: float,
-        target: float,
-        stoploss: float,
-        exchange: str = "NSE"
+        entry_price: float,
+        target_price: float,
+        stop_loss: float,
+        exchange: str = "NSE",
+        product_type: str = "INTRADAY",
+        trailing_sl: float = None
     ) -> Dict[str, Any]:
         """
         Place a bracket order (BO).
         
         Note: Zerodha has discontinued bracket orders.
         This method is kept for interface compatibility but will return an error.
+        Use GTT orders instead for target/stoploss triggers.
         """
         return {
             "status": "error",
-            "message": "Bracket orders are no longer supported by Zerodha"
+            "message": "Bracket orders are no longer supported by Zerodha. Use GTT orders instead."
         }
+    
+    def place_gtt_order(
+        self,
+        symbol: str,
+        action: str,
+        quantity: int,
+        trigger_price: float,
+        price: float,
+        exchange: str = "NSE",
+        order_type: str = "LIMIT"
+    ) -> Dict[str, Any]:
+        """
+        Place a GTT (Good Till Triggered) order on Zerodha.
+        
+        Zerodha supports GTT via the gtt_place_order API.
+        """
+        if not self.is_logged_in:
+            return {"status": "error", "message": "Not logged in"}
+        
+        try:
+            transaction_type = self._kite.TRANSACTION_TYPE_BUY if action.upper() == "BUY" else self._kite.TRANSACTION_TYPE_SELL
+            
+            # For single trigger GTT
+            gtt_params = {
+                "trigger_type": self._kite.GTT_TYPE_SINGLE,
+                "tradingsymbol": symbol,
+                "exchange": exchange,
+                "trigger_values": [trigger_price],
+                "last_price": trigger_price,  # Will be replaced with actual LTP
+                "orders": [{
+                    "transaction_type": transaction_type,
+                    "quantity": quantity,
+                    "order_type": self._kite.ORDER_TYPE_LIMIT if order_type == "LIMIT" else self._kite.ORDER_TYPE_MARKET,
+                    "product": self._kite.PRODUCT_CNC,
+                    "price": price
+                }]
+            }
+            
+            # Get current LTP
+            try:
+                ltp = self.get_ltp(symbol, exchange)
+                if ltp:
+                    gtt_params["last_price"] = ltp
+            except Exception:
+                pass
+            
+            if hasattr(self._kite, 'gtt_place_order'):
+                result = self._kite.place_gtt(**gtt_params)
+                return {
+                    "status": "success",
+                    "gtt_id": result.get("trigger_id"),
+                    "message": "GTT order created successfully"
+                }
+            else:
+                return {
+                    "status": "error",
+                    "message": "GTT not supported in current kiteconnect version"
+                }
+                
+        except Exception as e:
+            logger.error(f"GTT order failed: {str(e)}")
+            return {"status": "error", "message": str(e)}
+    
+    def get_all_order_statuses(self) -> Dict[str, Any]:
+        """Get all orders with their statuses."""
+        if not self.is_logged_in:
+            return {"status": "error", "message": "Not logged in", "orders": []}
+        
+        try:
+            orders = self._kite.orders()
+            order_list = []
+            
+            for order in orders:
+                status = order.get("status", "").lower()
+                
+                # Map Zerodha statuses to internal statuses
+                if status == "complete":
+                    internal_status = "EXECUTED"
+                elif status == "rejected":
+                    internal_status = "REJECTED"
+                elif status == "cancelled":
+                    internal_status = "CANCELLED"
+                elif status in ["open", "pending", "trigger pending"]:
+                    internal_status = "OPEN"
+                else:
+                    internal_status = "PENDING"
+                
+                order_list.append({
+                    "order_id": order.get("order_id"),
+                    "broker_status": status,
+                    "internal_status": internal_status,
+                    "symbol": order.get("tradingsymbol"),
+                    "quantity": order.get("quantity"),
+                    "filled_quantity": order.get("filled_quantity", 0),
+                    "average_price": order.get("average_price", 0),
+                    "rejection_reason": order.get("status_message") if status == "rejected" else None
+                })
+            
+            return {"status": "success", "orders": order_list}
+            
+        except Exception as e:
+            logger.error(f"Get all order statuses failed: {str(e)}")
+            return {"status": "error", "message": str(e), "orders": []}
     
     def get_profile(self) -> Dict[str, Any]:
         """Get user profile information."""

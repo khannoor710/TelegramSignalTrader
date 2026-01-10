@@ -750,6 +750,232 @@ class AngelOneBrokerService(BrokerInterface):
         """Force refresh of instrument master data"""
         return symbol_master.load_instruments(force_refresh=True)
     
+    def place_bracket_order(
+        self,
+        symbol: str,
+        action: str,
+        quantity: int,
+        entry_price: float,
+        target_price: float,
+        stop_loss: float,
+        exchange: str = "NSE",
+        product_type: str = "INTRADAY",
+        trailing_sl: float = None
+    ) -> Dict[str, Any]:
+        """
+        Place a bracket order on Angel One.
+        
+        Uses ROBO variety with BO product type.
+        Bracket orders automatically place entry + target + SL in one order.
+        """
+        if not self._is_logged_in or not self.smart_api:
+            logger.error("❌ Attempt to place bracket order but not logged in")
+            return {"status": "error", "message": "Not logged in"}
+        
+        try:
+            transaction_type = "BUY" if action.upper() == "BUY" else "SELL"
+            
+            # Calculate squareoff and stoploss in absolute points
+            if action.upper() == "BUY":
+                squareoff_points = abs(target_price - entry_price)
+                stoploss_points = abs(entry_price - stop_loss)
+            else:
+                squareoff_points = abs(entry_price - target_price)
+                stoploss_points = abs(stop_loss - entry_price)
+            
+            # Get symbol token
+            symbol_token = self._get_symbol_token(symbol, exchange)
+            
+            order_params = {
+                "variety": "ROBO",  # Bracket order variety
+                "tradingsymbol": symbol,
+                "symboltoken": symbol_token,
+                "transactiontype": transaction_type,
+                "exchange": exchange,
+                "ordertype": "LIMIT",
+                "producttype": "BO",  # Bracket order product
+                "duration": "DAY",
+                "price": entry_price,
+                "squareoff": squareoff_points,
+                "stoploss": stoploss_points,
+                "quantity": quantity
+            }
+            
+            # Add trailing stop-loss if provided
+            if trailing_sl and trailing_sl > 0:
+                order_params["trailingstoploss"] = trailing_sl
+            
+            logger.info(f"📤 Placing bracket order: {order_params}")
+            
+            response = self.smart_api.placeOrder(order_params)
+            logger.info(f"📥 Bracket order response: {response}")
+            
+            if isinstance(response, str):
+                # Response is order ID string
+                return {
+                    "status": "success",
+                    "message": "Bracket order placed successfully",
+                    "order_id": response,
+                    "entry_price": entry_price,
+                    "target_price": target_price,
+                    "stop_loss": stop_loss
+                }
+            elif isinstance(response, dict):
+                if response.get('status'):
+                    data = response.get('data', {})
+                    return {
+                        "status": "success",
+                        "message": "Bracket order placed successfully",
+                        "order_id": data.get('orderid') if data else response.get('orderid'),
+                        "entry_price": entry_price,
+                        "target_price": target_price,
+                        "stop_loss": stop_loss
+                    }
+                else:
+                    error_msg = response.get('message', 'Bracket order failed')
+                    logger.error(f"❌ Bracket order failed: {error_msg}")
+                    return {"status": "error", "message": error_msg}
+            else:
+                return {"status": "error", "message": f"Unexpected response: {type(response)}"}
+                
+        except Exception as e:
+            logger.error(f"❌ Bracket order exception: {str(e)}")
+            return {"status": "error", "message": str(e)}
+    
+    def place_gtt_order(
+        self,
+        symbol: str,
+        action: str,
+        quantity: int,
+        trigger_price: float,
+        price: float,
+        exchange: str = "NSE",
+        order_type: str = "LIMIT"
+    ) -> Dict[str, Any]:
+        """
+        Place a GTT (Good Till Triggered) order on Angel One.
+        
+        Note: Angel One's GTT implementation uses gttCreateRule API.
+        """
+        if not self._is_logged_in or not self.smart_api:
+            return {"status": "error", "message": "Not logged in"}
+        
+        try:
+            transaction_type = "BUY" if action.upper() == "BUY" else "SELL"
+            symbol_token = self._get_symbol_token(symbol, exchange)
+            
+            gtt_params = {
+                "tradingsymbol": symbol,
+                "symboltoken": symbol_token,
+                "exchange": exchange,
+                "producttype": "DELIVERY",
+                "transactiontype": transaction_type,
+                "price": price,
+                "qty": quantity,
+                "disclosedqty": 0,
+                "triggerprice": trigger_price,
+                "timeperiod": 365  # Valid for 1 year
+            }
+            
+            logger.info(f"📤 Placing GTT order: {gtt_params}")
+            
+            # Angel One uses gttCreateRule API
+            if hasattr(self.smart_api, 'gttCreateRule'):
+                response = self.smart_api.gttCreateRule(gtt_params)
+            else:
+                # Fallback: GTT not supported in this SDK version
+                return {
+                    "status": "error",
+                    "message": "GTT orders not supported in current SmartAPI version"
+                }
+            
+            if response and response.get('status'):
+                return {
+                    "status": "success",
+                    "gtt_id": response.get('data', {}).get('id'),
+                    "message": "GTT order created successfully"
+                }
+            else:
+                error_msg = response.get('message', 'GTT creation failed') if response else 'GTT failed'
+                return {"status": "error", "message": error_msg}
+                
+        except Exception as e:
+            logger.error(f"❌ GTT order exception: {str(e)}")
+            return {"status": "error", "message": str(e)}
+    
+    def modify_order(
+        self,
+        order_id: str,
+        quantity: int = None,
+        price: float = None,
+        trigger_price: float = None,
+        order_type: str = None
+    ) -> Dict[str, Any]:
+        """
+        Modify an existing open order on Angel One.
+        """
+        if not self._is_logged_in or not self.smart_api:
+            return {"status": "error", "message": "Not logged in"}
+        
+        try:
+            # First, get the current order details
+            order_book = self.smart_api.orderBook()
+            if not order_book or not order_book.get('status'):
+                return {"status": "error", "message": "Could not fetch order details"}
+            
+            # Find the order
+            current_order = None
+            for order in (order_book.get('data') or []):
+                if str(order.get('orderid')) == str(order_id):
+                    current_order = order
+                    break
+            
+            if not current_order:
+                return {"status": "error", "message": f"Order {order_id} not found"}
+            
+            # Check if order can be modified (must be open/pending)
+            order_status = current_order.get('orderstatus', '').lower()
+            if order_status not in ['open', 'pending', 'trigger pending']:
+                return {
+                    "status": "error",
+                    "message": f"Cannot modify order with status: {order_status}"
+                }
+            
+            # Build modify params
+            modify_params = {
+                "variety": current_order.get('variety', 'NORMAL'),
+                "orderid": order_id,
+                "ordertype": order_type or current_order.get('ordertype'),
+                "producttype": current_order.get('producttype'),
+                "duration": "DAY",
+                "price": price if price is not None else float(current_order.get('price', 0)),
+                "quantity": quantity if quantity is not None else int(current_order.get('quantity', 0)),
+                "tradingsymbol": current_order.get('tradingsymbol'),
+                "symboltoken": current_order.get('symboltoken'),
+                "exchange": current_order.get('exchange')
+            }
+            
+            if trigger_price is not None:
+                modify_params["triggerprice"] = trigger_price
+            
+            logger.info(f"📤 Modifying order {order_id}: {modify_params}")
+            
+            response = self.smart_api.modifyOrder(modify_params)
+            
+            if response and response.get('status'):
+                return {
+                    "status": "success",
+                    "message": f"Order {order_id} modified successfully",
+                    "order_id": order_id
+                }
+            else:
+                error_msg = response.get('message', 'Modify failed') if response else 'Modify failed'
+                return {"status": "error", "message": error_msg}
+                
+        except Exception as e:
+            logger.error(f"❌ Modify order exception: {str(e)}")
+            return {"status": "error", "message": str(e)}
+    
     def logout(self) -> None:
         """Logout from broker"""
         if self.smart_api:

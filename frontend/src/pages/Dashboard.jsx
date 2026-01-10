@@ -8,7 +8,7 @@ function Dashboard({ telegramStatus, brokerStatus, wsConnected }) {
   const [messageStats, setMessageStats] = useState(null)
   const [loading, setLoading] = useState(true)
   const [syncing, setSyncing] = useState(false)
-  
+
   // Use ref to prevent multiple simultaneous fetches
   const isFetchingRef = useRef(false)
   const abortControllerRef = useRef(null)
@@ -18,13 +18,13 @@ function Dashboard({ telegramStatus, brokerStatus, wsConnected }) {
     // Prevent overlapping fetches
     if (isFetchingRef.current) return
     isFetchingRef.current = true
-    
+
     // Abort any previous pending request
     if (abortControllerRef.current) {
       abortControllerRef.current.abort()
     }
     abortControllerRef.current = new AbortController()
-    
+
     try {
       const [statsRes, tradesRes, msgStatsRes] = await Promise.all([
         api.get('/trades/stats/summary', { signal: abortControllerRef.current.signal }),
@@ -79,11 +79,11 @@ function Dashboard({ telegramStatus, brokerStatus, wsConnected }) {
   const getStatusBadge = (trade) => {
     const status = trade.status
     const brokerStatus = trade.broker_status
-    
+
     let badgeClass = 'badge-pending'
     let displayText = status
     let title = ''
-    
+
     switch (status) {
       case 'EXECUTED':
         badgeClass = 'badge-success'
@@ -123,7 +123,7 @@ function Dashboard({ telegramStatus, brokerStatus, wsConnected }) {
       default:
         displayText = status
     }
-    
+
     return (
       <span className={`badge ${badgeClass}`} title={title} style={{ cursor: title ? 'help' : 'default' }}>
         {displayText}
@@ -416,13 +416,34 @@ function Dashboard({ telegramStatus, brokerStatus, wsConnected }) {
           <Link to="/signal-tester" className="btn">
             🧪 Test Signal Parser
           </Link>
-          <button 
-            onClick={syncOrderStatuses} 
-            className="btn" 
+          <button
+            onClick={syncOrderStatuses}
+            className="btn"
             disabled={syncing || !brokerStatus?.is_logged_in}
             style={{ opacity: syncing ? 0.7 : 1 }}
           >
             {syncing ? '🔄 Syncing...' : '🔄 Sync Order Status'}
+          </button>
+          <button
+            onClick={async () => {
+              if (!window.confirm('⚠️ This will close ALL open positions at market price. Are you sure?')) return;
+              try {
+                const response = await api.post('/broker/positions/square-off-all');
+                if (response.data.closed > 0) {
+                  alert(`✅ Closed ${response.data.closed} positions`);
+                } else {
+                  alert('No open positions to close');
+                }
+                fetchData();
+              } catch (error) {
+                alert(`❌ Failed: ${error.response?.data?.detail || error.message}`);
+              }
+            }}
+            className="btn"
+            disabled={!brokerStatus?.is_logged_in}
+            style={{ backgroundColor: 'var(--danger-color)', color: 'white' }}
+          >
+            🛑 Square Off All
           </button>
           {messageStats?.unprocessed_signals > 0 && (
             <Link to="/telegram" className="btn" style={{ backgroundColor: 'var(--warning-color)', color: 'white' }}>

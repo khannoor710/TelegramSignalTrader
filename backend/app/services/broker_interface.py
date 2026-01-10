@@ -116,3 +116,95 @@ class BrokerInterface(ABC):
     def refresh_instruments(self) -> bool:
         """Refresh instrument master data."""
         pass
+    
+    # ============= Advanced Order Types =============
+    
+    @abstractmethod
+    def place_bracket_order(
+        self,
+        symbol: str,
+        action: str,
+        quantity: int,
+        entry_price: float,
+        target_price: float,
+        stop_loss: float,
+        exchange: str = "NSE",
+        product_type: str = "INTRADAY",
+        trailing_sl: float = None
+    ) -> Dict[str, Any]:
+        """
+        Place a bracket order with entry, target, and stop-loss.
+        
+        Args:
+            symbol: Trading symbol
+            action: BUY or SELL
+            quantity: Number of shares/contracts
+            entry_price: Entry limit price
+            target_price: Target/profit booking price
+            stop_loss: Stop-loss price
+            exchange: NSE, BSE, NFO, etc.
+            product_type: INTRADAY, DELIVERY
+            trailing_sl: Optional trailing stop-loss points
+        
+        Returns:
+            Dict with 'status', 'order_id', 'target_order_id', 'sl_order_id'
+        """
+        pass
+    
+    @abstractmethod
+    def place_gtt_order(
+        self,
+        symbol: str,
+        action: str,
+        quantity: int,
+        trigger_price: float,
+        price: float,
+        exchange: str = "NSE",
+        order_type: str = "LIMIT"
+    ) -> Dict[str, Any]:
+        """
+        Place a GTT (Good Till Triggered) order.
+        
+        Args:
+            symbol: Trading symbol
+            action: BUY or SELL
+            quantity: Number of shares
+            trigger_price: Price at which order gets triggered
+            price: Order price after trigger
+            exchange: Exchange
+            order_type: LIMIT or MARKET
+        
+        Returns:
+            Dict with 'status', 'gtt_id', 'message'
+        """
+        pass
+    
+    @abstractmethod
+    def modify_order(
+        self,
+        order_id: str,
+        quantity: int = None,
+        price: float = None,
+        trigger_price: float = None,
+        order_type: str = None
+    ) -> Dict[str, Any]:
+        """
+        Modify an existing open order.
+        
+        Args:
+            order_id: ID of order to modify
+            quantity: New quantity (optional)
+            price: New price (optional)
+            trigger_price: New trigger price (optional)
+            order_type: New order type (optional)
+        
+        Returns:
+            Dict with 'status' and 'message'
+        """
+        pass
+    
+    @abstractmethod
+    def get_all_order_statuses(self) -> Dict[str, Any]:
+        """Get all orders with their statuses."""
+        pass
+

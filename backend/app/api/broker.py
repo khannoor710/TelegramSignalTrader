@@ -777,3 +777,218 @@ async def complete_zerodha_login(request_token: str, db: Session = Depends(get_d
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
+
+# ============= Position Management Endpoints =============
+
+@router.post("/positions/square-off-all")
+async def square_off_all_positions(db: Session = Depends(get_db)):
+    """
+    Close all open positions.
+    
+    This will place market orders to close all intraday and delivery positions.
+    Use with caution!
+    """
+    # Get active broker
+    settings = db.query(AppSettings).first()
+    if not settings or not settings.active_broker_type:
+        broker = broker_service
+        broker_type = "angel_one"
+    else:
+        broker = broker_registry.create_broker(settings.active_broker_type)
+        broker_type = settings.active_broker_type
+    
+    if not broker.is_logged_in:
+        raise HTTPException(status_code=401, detail="Broker not logged in")
+    
+    # Get all positions
+    positions_result = broker.get_positions()
+    if positions_result.get('status') == 'error':
+        raise HTTPException(status_code=400, detail=positions_result.get('message', 'Failed to fetch positions'))
+    
+    positions = positions_result.get('data', [])
+    if not positions:
+        return {"status": "success", "message": "No open positions to close", "closed": 0}
+    
+    closed_count = 0
+    errors = []
+    
+    for position in positions:
+        try:
+            # Get position details
+            symbol = position.get('tradingsymbol') or position.get('symbol') or position.get('tsym')
+            quantity = int(position.get('netqty') or position.get('quantity') or position.get('net_quantity', 0))
+            exchange = position.get('exchange') or position.get('exch') or 'NSE'
+            product_type = position.get('producttype') or position.get('product') or 'INTRADAY'
+            
+            # Skip if no net position
+            if quantity == 0:
+                continue
+            
+            # Determine action (opposite of current position)
+            action = "SELL" if quantity > 0 else "BUY"
+            close_quantity = abs(quantity)
+            
+            # Place market order to close
+            result = broker.place_order(
+                symbol=symbol,
+                action=action,
+                quantity=close_quantity,
+                exchange=exchange,
+                order_type="MARKET",
+                product_type=product_type
+            )
+            
+            if result.get('status') == 'success':
+                closed_count += 1
+            else:
+                errors.append({
+                    "symbol": symbol,
+                    "error": result.get('message', 'Unknown error')
+                })
+        except Exception as e:
+            errors.append({
+                "symbol": position.get('tradingsymbol', 'Unknown'),
+                "error": str(e)
+            })
+    
+    # Clear cache after closing positions
+    clear_broker_cache()
+    
+    return {
+        "status": "success",
+        "message": f"Closed {closed_count} positions",
+        "closed": closed_count,
+        "errors": errors if errors else None
+    }
+
+
+@router.post("/positions/{position_key}/square-off")
+async def square_off_position(
+    position_key: str,
+    quantity: Optional[int] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Close a specific position.
+    
+    Args:
+        position_key: Format is "EXCHANGE:SYMBOL" (e.g., "NSE:RELIANCE-EQ")
+        quantity: Optional partial quantity to close. If not provided, closes entire position.
+    """
+    # Parse position key
+    try:
+        exchange, symbol = position_key.split(":", 1)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid position key. Use format 'EXCHANGE:SYMBOL'")
+    
+    # Get active broker
+    settings = db.query(AppSettings).first()
+    if not settings or not settings.active_broker_type:
+        broker = broker_service
+    else:
+        broker = broker_registry.create_broker(settings.active_broker_type)
+    
+    if not broker.is_logged_in:
+        raise HTTPException(status_code=401, detail="Broker not logged in")
+    
+    # Get positions to find the specific one
+    positions_result = broker.get_positions()
+    if positions_result.get('status') == 'error':
+        raise HTTPException(status_code=400, detail="Failed to fetch positions")
+    
+    positions = positions_result.get('data', [])
+    target_position = None
+    
+    for pos in positions:
+        pos_symbol = pos.get('tradingsymbol') or pos.get('symbol') or pos.get('tsym')
+        pos_exchange = pos.get('exchange') or pos.get('exch') or 'NSE'
+        
+        if pos_symbol == symbol and pos_exchange == exchange:
+            target_position = pos
+            break
+    
+    if not target_position:
+        raise HTTPException(status_code=404, detail=f"Position not found for {position_key}")
+    
+    # Get position quantity
+    net_qty = int(target_position.get('netqty') or target_position.get('quantity') or target_position.get('net_quantity', 0))
+    
+    if net_qty == 0:
+        return {"status": "success", "message": "Position already closed"}
+    
+    # Determine close quantity
+    close_qty = quantity if quantity else abs(net_qty)
+    if close_qty > abs(net_qty):
+        raise HTTPException(status_code=400, detail=f"Cannot close more than open quantity ({abs(net_qty)})")
+    
+    # Determine action
+    action = "SELL" if net_qty > 0 else "BUY"
+    product_type = target_position.get('producttype') or target_position.get('product') or 'INTRADAY'
+    
+    # Place order
+    result = broker.place_order(
+        symbol=symbol,
+        action=action,
+        quantity=close_qty,
+        exchange=exchange,
+        order_type="MARKET",
+        product_type=product_type
+    )
+    
+    if result.get('status') == 'success':
+        clear_broker_cache()
+        return {
+            "status": "success",
+            "message": f"Closed {close_qty} of {symbol}",
+            "order_id": result.get('order_id'),
+            "quantity_closed": close_qty,
+            "remaining": abs(net_qty) - close_qty
+        }
+    else:
+        raise HTTPException(status_code=400, detail=result.get('message', 'Square-off failed'))
+
+
+@router.put("/orders/{order_id}")
+async def modify_existing_order(
+    order_id: str,
+    quantity: Optional[int] = None,
+    price: Optional[float] = None,
+    trigger_price: Optional[float] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Modify an existing open order.
+    
+    Args:
+        order_id: ID of order to modify
+        quantity: New quantity (optional)
+        price: New price (optional)
+        trigger_price: New trigger price for SL orders (optional)
+    """
+    # Get active broker
+    settings = db.query(AppSettings).first()
+    if not settings or not settings.active_broker_type:
+        broker = broker_service
+    else:
+        broker = broker_registry.create_broker(settings.active_broker_type)
+    
+    if not broker.is_logged_in:
+        raise HTTPException(status_code=401, detail="Broker not logged in")
+    
+    if not any([quantity, price, trigger_price]):
+        raise HTTPException(status_code=400, detail="At least one modification parameter is required")
+    
+    result = broker.modify_order(
+        order_id=order_id,
+        quantity=quantity,
+        price=price,
+        trigger_price=trigger_price
+    )
+    
+    if result.get('status') == 'success':
+        clear_broker_cache()
+        return result
+    else:
+        raise HTTPException(status_code=400, detail=result.get('message', 'Modification failed'))
+
+
